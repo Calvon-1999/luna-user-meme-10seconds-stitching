@@ -72,7 +72,7 @@ async function fetchFromSupabase(uuid) {
     throw new Error('Supabase configuration missing. Set SUPABASE_URL and SUPABASE_ANON_KEY environment variables.');
   }
 
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}&select=*`, {
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/your_table_name?uuid=eq.${uuid}&select=*`, {
     headers: {
       'apikey': SUPABASE_ANON_KEY,
       'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
