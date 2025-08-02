@@ -415,6 +415,43 @@ app.get('/debug-supabase-enhanced/:uuid', async (req, res) => {
   }
 });
 
+// Test basic table access
+app.get('/debug-table-access', async (req, res) => {
+  try {
+    // Test 1: Get total count
+    const url1 = `${SUPABASE_URL}/rest/v1/luna-user-jobs?select=count`;
+    const response1 = await fetch(url1, {
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'count=exact'
+      }
+    });
+    const count = await response1.json();
+    
+    // Test 2: Get first 3 records with all columns
+    const url2 = `${SUPABASE_URL}/rest/v1/luna-user-jobs?select=*&limit=3`;
+    const response2 = await fetch(url2, {
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    const samples = await response2.json();
+    
+    res.json({
+      totalCount: count,
+      sampleRecords: samples,
+      hasRecords: Array.isArray(samples) && samples.length > 0
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message, stack: error.stack });
+  }
+});
+
 // Error handling middleware
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
