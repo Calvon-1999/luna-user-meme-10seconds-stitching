@@ -317,6 +317,48 @@ app.post('/process', upload.fields([
   }
 });
 
+// Debug endpoint to test Supabase connection
+app.get('/debug-supabase/:uuid', async (req, res) => {
+  try {
+    const { uuid } = req.params;
+    
+    console.log('SUPABASE_URL:', SUPABASE_URL);
+    console.log('SUPABASE_ANON_KEY exists:', !!SUPABASE_ANON_KEY);
+    console.log('Looking for UUID:', uuid);
+    
+    const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}&select=*`;
+    console.log('Query URL:', url);
+    
+    const response = await fetch(url, {
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    console.log('Response status:', response.status);
+    const data = await response.json();
+    console.log('Response data:', data);
+    
+    res.json({
+      supabaseUrl: SUPABASE_URL,
+      hasAnonymousKey: !!SUPABASE_ANON_KEY,
+      queryUrl: url,
+      responseStatus: response.status,
+      data: data,
+      found: data.length > 0
+    });
+    
+  } catch (error) {
+    console.error('Debug error:', error);
+    res.status(500).json({
+      error: error.message,
+      stack: error.stack
+    });
+  }
+});
+
 // Error handling middleware
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
