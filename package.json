@@ -22,14 +22,6 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "railway": {
-    "build": {
-      "buildCommand": "npm install"
-    },
-    "deploy": {
-      "startCommand": "npm start"
-    }
-  },
   "keywords": [
     "video",
     "audio",
