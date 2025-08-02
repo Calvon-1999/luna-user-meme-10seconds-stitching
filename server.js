@@ -1,6 +1,3 @@
-// Railway API with Supabase Integration
-// Accepts UUID and fetches video/audio URLs from Supabase
-
 const express = require('express');
 const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
@@ -203,11 +200,41 @@ app.post('/process-uuid', async (req, res) => {
     const stats = fs.statSync(outputPath);
     const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
 
+    // Create the complete download URL
+    const completeDownloadUrl = `https://luna-user-meme-10seconds-stitching-production.up.railway.app/downloads/${outputFileName}`;
+
+    // Update the Supabase record with the final stitched video URL
+    try {
+      const updateUrl = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}`;
+      const updateResponse = await fetch(updateUrl, {
+        method: 'PATCH',
+        headers: {
+          'apikey': SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'return=minimal'
+        },
+        body: JSON.stringify({
+          final_stitch_video: completeDownloadUrl,
+          status: 'stitched'
+        })
+      });
+      
+      if (!updateResponse.ok) {
+        console.warn('Failed to update Supabase record:', updateResponse.status);
+      } else {
+        console.log('Successfully updated Supabase with final stitched video URL');
+      }
+    } catch (updateError) {
+      console.warn('Error updating Supabase record:', updateError.message);
+    }
+
     res.json({
       success: true,
       message: 'Video processed successfully from Supabase record',
       uuid: uuid,
-      downloadUrl: `/downloads/${outputFileName}`,
+      downloadUrl: completeDownloadUrl,
+      final_stitch_video: completeDownloadUrl,
       fileSize: `${fileSizeMB} MB`,
       originalRecord: {
         videoUrl: videoUrl,
@@ -292,10 +319,14 @@ app.post('/process', upload.fields([
     const stats = fs.statSync(outputPath);
     const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
 
+    // Create complete URL for direct uploads too
+    const completeDownloadUrl = `https://luna-user-meme-10seconds-stitching-production.up.railway.app/downloads/${outputFileName}`;
+
     res.json({
       success: true,
       message: 'Video processed successfully',
-      downloadUrl: `/downloads/${outputFileName}`,
+      downloadUrl: completeDownloadUrl,
+      final_stitch_video: completeDownloadUrl,
       fileSize: `${fileSizeMB} MB`,
       processedAt: new Date().toISOString()
     });
@@ -310,14 +341,12 @@ app.post('/process', upload.fields([
       try { fs.unlinkSync(req.files.audio[0].path); } catch (e) {}
     }
 
-    res.status(500).json({
+    res.json({
       error: 'Processing failed',
       details: error.message
     });
   }
 });
-
-// ... your existing endpoints ...
 
 // Debug endpoint to test Supabase connection
 app.get('/debug-supabase/:uuid', async (req, res) => {
@@ -359,11 +388,6 @@ app.get('/debug-supabase/:uuid', async (req, res) => {
       stack: error.stack
     });
   }
-});
-
-// Error handling middleware (existing code)
-app.use((error, req, res, next) => {
-  // ... existing error handling code ...
 });
 
 // Find records with video/audio files
