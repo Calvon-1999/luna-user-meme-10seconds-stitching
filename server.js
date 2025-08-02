@@ -1,5 +1,5 @@
-// Railway-Ready Video Processing API
-// A Node.js Express server that processes video and audio files
+// Railway API with Supabase Integration
+// Accepts UUID and fetches video/audio URLs from Supabase
 
 const express = require('express');
 const multer = require('multer');
@@ -7,29 +7,19 @@ const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
+const fetch = require('node-fetch');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Ensure directories exist on startup
-const ensureDirectories = () => {
-  const dirs = ['./uploads', './outputs', './temp'];
-  dirs.forEach(dir => {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-      console.log(`Created directory: ${dir}`);
-    }
-  });
-};
+// Supabase configuration - set these as Railway environment variables
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
-// Call this on startup
-ensureDirectories();
-
-// Configure multer for file uploads
+// Configure multer for direct file uploads (fallback)
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const uploadDir = './uploads';
-    // Double-check directory exists
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
     }
@@ -43,33 +33,73 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage: storage,
-  limits: {
-    fileSize: 100 * 1024 * 1024, // 100MB limit
-  },
-  fileFilter: (req, file, cb) => {
-    // Accept video and audio files
-    if (file.mimetype.startsWith('video/') || file.mimetype.startsWith('audio/')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only video and audio files are allowed'), false);
-    }
-  }
+  limits: { fileSize: 100 * 1024 * 1024 }
 });
+
+// Ensure directories exist on startup
+const ensureDirectories = () => {
+  const dirs = ['./uploads', './outputs', './temp'];
+  dirs.forEach(dir => {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+      console.log(`Created directory: ${dir}`);
+    }
+  });
+};
+
+ensureDirectories();
 
 // Middleware
 app.use(express.json());
 app.use(express.static('public'));
-
-// Serve processed files
 app.use('/downloads', express.static('outputs'));
+
+// Helper function to download file from URL
+async function downloadFile(url, outputPath) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to download file: ${response.statusText}`);
+  }
+  
+  const buffer = await response.buffer();
+  fs.writeFileSync(outputPath, buffer);
+  return outputPath;
+}
+
+// Helper function to fetch record from Supabase
+async function fetchFromSupabase(uuid) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    throw new Error('Supabase configuration missing. Set SUPABASE_URL and SUPABASE_ANON_KEY environment variables.');
+  }
+
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}&select=*`, {
+    headers: {
+      'apikey': SUPABASE_ANON_KEY,
+      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Supabase query failed: ${response.statusText}`);
+  }
+
+  const data = await response.json();
+  if (data.length === 0) {
+    throw new Error(`No record found for UUID: ${uuid}`);
+  }
+
+  return data[0]; // Return first matching record
+}
 
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({
-    message: 'Video Processing API is running!',
+    message: 'Video Processing API with Supabase Integration',
     endpoints: {
-      upload: 'POST /process',
-      health: 'GET /health'
+      'POST /process': 'Upload video and audio files directly',
+      'POST /process-uuid': 'Process using Supabase UUID',
+      'GET /health': 'Health check'
     }
   });
 });
@@ -78,7 +108,126 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-// Main processing endpoint
+// NEW: Process using Supabase UUID
+app.post('/process-uuid', async (req, res) => {
+  try {
+    const { uuid } = req.body;
+    
+    if (!uuid) {
+      return res.status(400).json({
+        error: 'UUID is required',
+        example: { uuid: 'your-supabase-uuid-here' }
+      });
+    }
+
+    console.log(`Processing UUID: ${uuid}`);
+
+    // Fetch record from Supabase
+    const record = await fetchFromSupabase(uuid);
+    
+    const videoUrl = record.final_video_url;
+    const audioUrl = record.final_audio_file;
+
+    if (!videoUrl || !audioUrl) {
+      return res.status(400).json({
+        error: 'Video or audio URL missing in Supabase record',
+        found: { videoUrl: !!videoUrl, audioUrl: !!audioUrl }
+      });
+    }
+
+    console.log(`Found URLs - Video: ${videoUrl}, Audio: ${audioUrl}`);
+
+    // Create temporary file paths
+    const tempVideoPath = `./temp/video-${uuid}.mp4`;
+    const tempAudioPath = `./temp/audio-${uuid}.mp3`;
+
+    // Download files
+    console.log('Downloading video file...');
+    await downloadFile(videoUrl, tempVideoPath);
+    
+    console.log('Downloading audio file...');
+    await downloadFile(audioUrl, tempAudioPath);
+
+    // Process with FFmpeg
+    const outputDir = './outputs';
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+
+    const outputFileName = `processed-${uuid}.mp4`;
+    const outputPath = path.join(outputDir, outputFileName);
+
+    console.log('Starting FFmpeg processing...');
+
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(tempVideoPath)
+        .input(tempAudioPath)
+        .complexFilter([
+          '[1:a]atrim=0:5,afade=in:st=0:d=0.5,afade=out:st=4.5:d=0.5[audio_processed]'
+        ])
+        .outputOptions([
+          '-map 0:v',
+          '-map [audio_processed]',
+          '-c:v copy',
+          '-c:a aac',
+          '-b:a 128k'
+        ])
+        .output(outputPath)
+        .on('start', (commandLine) => {
+          console.log('FFmpeg command:', commandLine);
+        })
+        .on('progress', (progress) => {
+          console.log(`Processing: ${Math.round(progress.percent || 0)}% done`);
+        })
+        .on('end', () => {
+          console.log('Processing completed successfully');
+          resolve();
+        })
+        .on('error', (err) => {
+          console.error('FFmpeg error:', err.message);
+          reject(err);
+        })
+        .run();
+    });
+
+    // Clean up temporary files
+    try {
+      fs.unlinkSync(tempVideoPath);
+      fs.unlinkSync(tempAudioPath);
+    } catch (e) {
+      console.warn('Could not clean up temp files:', e.message);
+    }
+
+    // Get file stats
+    const stats = fs.statSync(outputPath);
+    const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+
+    res.json({
+      success: true,
+      message: 'Video processed successfully from Supabase record',
+      uuid: uuid,
+      downloadUrl: `/downloads/${outputFileName}`,
+      fileSize: `${fileSizeMB} MB`,
+      originalRecord: {
+        videoUrl: videoUrl,
+        audioUrl: audioUrl
+      },
+      processedAt: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Processing error:', error);
+    
+    res.status(500).json({
+      error: 'Processing failed',
+      details: error.message,
+      uuid: req.body.uuid
+    });
+  }
+});
+
+// EXISTING: Direct file upload endpoint
 app.post('/process', upload.fields([
   { name: 'video', maxCount: 1 },
   { name: 'audio', maxCount: 1 }
@@ -94,10 +243,8 @@ app.post('/process', upload.fields([
     }
 
     const outputDir = './outputs';
-    // Ensure output directory exists
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true });
-      console.log('Created outputs directory');
     }
 
     const outputFileName = `processed-${uuidv4()}.mp4`;
@@ -111,15 +258,14 @@ app.post('/process', upload.fields([
         .input(videoFile.path)
         .input(audioFile.path)
         .complexFilter([
-          // Trim audio to 5 seconds and add fades
           '[1:a]atrim=0:5,afade=in:st=0:d=0.5,afade=out:st=4.5:d=0.5[audio_processed]'
         ])
         .outputOptions([
-          '-map 0:v',  // Map video from first input
-          '-map [audio_processed]',  // Map processed audio
-          '-c:v copy',  // Copy video without re-encoding
-          '-c:a aac',   // Encode audio as AAC
-          '-b:a 128k'   // Audio bitrate
+          '-map 0:v',
+          '-map [audio_processed]',
+          '-c:v copy',
+          '-c:a aac',
+          '-b:a 128k'
         ])
         .output(outputPath)
         .on('start', (commandLine) => {
@@ -143,7 +289,6 @@ app.post('/process', upload.fields([
     fs.unlinkSync(videoFile.path);
     fs.unlinkSync(audioFile.path);
 
-    // Get file stats
     const stats = fs.statSync(outputPath);
     const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
 
@@ -158,7 +303,6 @@ app.post('/process', upload.fields([
   } catch (error) {
     console.error('Processing error:', error);
     
-    // Clean up files on error
     if (req.files.video?.[0]?.path) {
       try { fs.unlinkSync(req.files.video[0].path); } catch (e) {}
     }
@@ -175,15 +319,6 @@ app.post('/process', upload.fields([
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  if (error instanceof multer.MulterError) {
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({
-        error: 'File too large',
-        message: 'Maximum file size is 100MB'
-      });
-    }
-  }
-  
   console.error('Unhandled error:', error);
   res.status(500).json({
     error: 'Internal server error',
@@ -191,12 +326,12 @@ app.use((error, req, res, next) => {
   });
 });
 
-// Cleanup old files periodically (every hour)
+// Cleanup old files periodically
 setInterval(() => {
   const now = Date.now();
   const oneHour = 60 * 60 * 1000;
   
-  ['./uploads', './outputs'].forEach(dir => {
+  ['./uploads', './outputs', './temp'].forEach(dir => {
     if (fs.existsSync(dir)) {
       fs.readdir(dir, (err, files) => {
         if (err) return;
@@ -216,10 +351,11 @@ setInterval(() => {
       });
     }
   });
-}, 60 * 60 * 1000); // Run every hour
+}, 60 * 60 * 1000);
 
 app.listen(PORT, () => {
   console.log(`🚀 Video Processing API running on port ${PORT}`);
-  console.log(`📁 Upload endpoint: POST /process`);
+  console.log(`📁 Direct upload: POST /process`);
+  console.log(`🆔 UUID processing: POST /process-uuid`);
   console.log(`🔗 Health check: GET /health`);
 });
