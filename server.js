@@ -317,45 +317,52 @@ app.post('/process', upload.fields([
   }
 });
 
-// Debug endpoint to test Supabase connection
-app.get('/debug-supabase/:uuid', async (req, res) => {
+// Enhanced debug endpoint to test different query approaches
+app.get('/debug-supabase-enhanced/:uuid', async (req, res) => {
   try {
     const { uuid } = req.params;
+    const results = {};
     
-    console.log('SUPABASE_URL:', SUPABASE_URL);
-    console.log('SUPABASE_ANON_KEY exists:', !!SUPABASE_ANON_KEY);
-    console.log('Looking for UUID:', uuid);
-    
-    const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}&select=*`;
-    console.log('Query URL:', url);
-    
-    const response = await fetch(url, {
+    // Test 1: Exact match (current approach)
+    const url1 = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}&select=*`;
+    const response1 = await fetch(url1, {
       headers: {
         'apikey': SUPABASE_ANON_KEY,
         'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
         'Content-Type': 'application/json'
       }
     });
+    results.exactMatch = await response1.json();
     
-    console.log('Response status:', response.status);
-    const data = await response.json();
-    console.log('Response data:', data);
+    // Test 2: Like search (in case of extra characters)
+    const url2 = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=like.*${uuid}*&select=*`;
+    const response2 = await fetch(url2, {
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    results.likeSearch = await response2.json();
+    
+    // Test 3: Get all records to see what's actually there
+    const url3 = `${SUPABASE_URL}/rest/v1/luna-user-jobs?select=uuid&limit=5`;
+    const response3 = await fetch(url3, {
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    results.sampleUuids = await response3.json();
     
     res.json({
-      supabaseUrl: SUPABASE_URL,
-      hasAnonymousKey: !!SUPABASE_ANON_KEY,
-      queryUrl: url,
-      responseStatus: response.status,
-      data: data,
-      found: data.length > 0
+      searchingFor: uuid,
+      results: results
     });
     
   } catch (error) {
-    console.error('Debug error:', error);
-    res.status(500).json({
-      error: error.message,
-      stack: error.stack
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
