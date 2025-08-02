@@ -366,6 +366,28 @@ app.use((error, req, res, next) => {
   // ... existing error handling code ...
 });
 
+// Find records with video/audio files
+app.get('/debug-find-complete-records', async (req, res) => {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs?select=uuid,final_video_url,final_audio_file&final_video_url=not.is.null&final_audio_file=not.is.null&limit=5`;
+    const response = await fetch(url, {
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    const data = await response.json();
+    
+    res.json({
+      recordsWithVideoAndAudio: data
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Enhanced debug endpoint to test different query approaches
 app.get('/debug-supabase-enhanced/:uuid', async (req, res) => {
   try {
