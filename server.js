@@ -48,7 +48,6 @@ ensureDirectories();
 
 // Middleware
 app.use(express.json());
-app.use(express.static('public'));
 app.use('/downloads', express.static('outputs'));
 
 // Helper function to download file from URL
@@ -89,23 +88,85 @@ async function fetchFromSupabase(uuid) {
   return data[0]; // Return first matching record
 }
 
-// Health check endpoint
+// Serve the index.html file at the root URL
 app.get('/', (req, res) => {
-  res.json({
-    message: 'Video Processing API with Supabase Integration',
-    endpoints: {
-      'POST /process': 'Upload video and audio files directly',
-      'POST /process-uuid': 'Process using Supabase UUID',
-      'GET /health': 'Health check'
-    }
-  });
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-// NEW: Process using Supabase UUID
+// NEW: Create video endpoint (handles form submission from web interface)
+app.post('/api/create-video', upload.single('image'), async (req, res) => {
+  try {
+    const { username, tweet, imageUrl } = req.body;
+    const imageFile = req.file;
+    
+    // Create a new record in Supabase
+    const uuid = uuidv4();
+    const insertUrl = `${SUPABASE_URL}/rest/v1/luna-user-jobs`;
+    
+    const insertData = {
+      uuid: uuid,
+      user_name: username,
+      original_message: tweet,
+      user_image_url: imageUrl || null,
+      status: 'pending',
+      created_at: new Date().toISOString()
+    };
+    
+    const response = await fetch(insertUrl, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(insertData)
+    });
+    
+    if (!response.ok) {
+      throw new Error('Failed to create video job');
+    }
+    
+    res.json({
+      success: true,
+      uuid: uuid,
+      message: 'Video creation started'
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to start video creation',
+      details: error.message
+    });
+  }
+});
+
+// NEW: Status check endpoint (for web interface polling)
+app.get('/api/status/:uuid', async (req, res) => {
+  try {
+    const { uuid } = req.params;
+    const record = await fetchFromSupabase(uuid);
+    
+    res.json({
+      uuid: uuid,
+      status: record.status,
+      final_stitch_video: record.final_stitch_video,
+      error_message: record.error_message,
+      created_at: record.created_at
+    });
+    
+  } catch (error) {
+    res.status(404).json({
+      error: 'Video not found',
+      details: error.message
+    });
+  }
+});
+
+// Process using Supabase UUID
 app.post('/process-uuid', async (req, res) => {
   try {
     const { uuid } = req.body;
@@ -216,7 +277,8 @@ app.post('/process-uuid', async (req, res) => {
         },
         body: JSON.stringify({
           final_stitch_video: completeDownloadUrl,
-          status: 'stitched'
+          status: 'stitched',
+          time_completion: new Date().toISOString()
         })
       });
       
@@ -246,6 +308,26 @@ app.post('/process-uuid', async (req, res) => {
   } catch (error) {
     console.error('Processing error:', error);
     
+    // Update Supabase with error status
+    try {
+      const updateUrl = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${req.body.uuid}`;
+      await fetch(updateUrl, {
+        method: 'PATCH',
+        headers: {
+          'apikey': SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'return=minimal'
+        },
+        body: JSON.stringify({
+          status: 'failed',
+          error_message: error.message
+        })
+      });
+    } catch (updateError) {
+      console.warn('Failed to update error status in Supabase:', updateError.message);
+    }
+    
     res.status(500).json({
       error: 'Processing failed',
       details: error.message,
@@ -254,7 +336,7 @@ app.post('/process-uuid', async (req, res) => {
   }
 });
 
-// EXISTING: Direct file upload endpoint
+// Direct file upload endpoint
 app.post('/process', upload.fields([
   { name: 'video', maxCount: 1 },
   { name: 'audio', maxCount: 1 }
@@ -341,7 +423,7 @@ app.post('/process', upload.fields([
       try { fs.unlinkSync(req.files.audio[0].path); } catch (e) {}
     }
 
-    res.json({
+    res.status(500).json({
       error: 'Processing failed',
       details: error.message
     });
@@ -536,6 +618,7 @@ setInterval(() => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Video Processing API running on port ${PORT}`);
+  console.log(`🎬 Web Interface: https://luna-user-meme-10seconds-stitching-production.up.railway.app`);
   console.log(`📁 Direct upload: POST /process`);
   console.log(`🆔 UUID processing: POST /process-uuid`);
   console.log(`🔗 Health check: GET /health`);
