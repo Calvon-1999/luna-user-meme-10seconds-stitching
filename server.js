@@ -15,7 +15,7 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
 // DreamFace API configuration
 const DREAMFACE_API_KEY = process.env.DREAMFACE_API_KEY;
-const DREAMFACE_API_URL = 'https://api.newportai.com/v1/lipsync'; // Try this endpoint first
+const DREAMFACE_API_URL = 'https://api.newportai.com/api/async/lipsync'; // Correct endpoint from their website
 
 // Configure multer for direct file uploads (fallback)
 const storage = multer.diskStorage({
@@ -139,78 +139,54 @@ async function callDreamFaceAPI(videoUrl, audioUrl) {
     srcVideoUrl: videoUrl,
     audioUrl: audioUrl,
     videoParams: {
-      video_width: 512,     // Fixed size instead of 0
-      video_height: 512,    // Fixed size instead of 0  
-      video_enhance: 1,     // Enable enhancement (was 0)
+      video_width: 512,
+      video_height: 512,
+      video_enhance: 1,
       fps: "25"
     }
   };
 
   console.log('Calling DreamFace API with:', requestBody);
+  console.log('Using endpoint:', DREAMFACE_API_URL);
 
-  // Try multiple possible endpoints
-  const possibleEndpoints = [
-    'https://api.newportai.com/v1/lipsync',
-    'https://api.newportai.com/lipsync',
-    'https://api.newportai.com/dreamface/lipsync',
-    'https://api.newportai.com/api/v1/lipsync'
-  ];
+  try {
+    const response = await fetch(DREAMFACE_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${DREAMFACE_API_KEY}`
+      },
+      body: JSON.stringify(requestBody)
+    });
 
-  let lastError;
-  
-  for (const endpoint of possibleEndpoints) {
-    try {
-      console.log(`Trying endpoint: ${endpoint}`);
-      
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${DREAMFACE_API_KEY}`,
-          'User-Agent': 'Luna-Video-Processor/1.0'
-        },
-        body: JSON.stringify(requestBody)
-      });
+    console.log(`DreamFace API response status: ${response.status}`);
 
-      console.log(`Response status: ${response.status}`);
-      
-      if (response.status === 405) {
-        console.log(`405 Method Not Allowed for ${endpoint}, trying next...`);
-        continue;
-      }
-      
-      if (response.status === 404) {
-        console.log(`404 Not Found for ${endpoint}, trying next...`);
-        continue;
-      }
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.log(`Error response: ${errorText}`);
-        lastError = new Error(`API error ${response.status}: ${errorText}`);
-        continue;
-      }
-
-      const result = await response.json();
-      console.log('DreamFace API success response:', result);
-
-      if (!result.taskId && !result.task_id && !result.id) {
-        throw new Error('No task ID received from DreamFace API');
-      }
-
-      return {
-        taskId: result.taskId || result.task_id || result.id,
-        endpoint: endpoint
-      };
-
-    } catch (error) {
-      console.error(`Error with endpoint ${endpoint}:`, error.message);
-      lastError = error;
-      continue;
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('DreamFace API error response:', errorText);
+      throw new Error(`DreamFace API error: ${response.status} - ${errorText}`);
     }
-  }
 
-  throw lastError || new Error('All DreamFace API endpoints failed');
+    const result = await response.json();
+    console.log('DreamFace API success response:', result);
+
+    // Handle different possible response formats
+    const taskId = result.taskId || result.task_id || result.id || result.requestId;
+    
+    if (!taskId) {
+      console.error('No task ID found in response:', result);
+      throw new Error('No task ID received from DreamFace API');
+    }
+
+    return {
+      taskId: taskId,
+      rawResponse: result
+    };
+
+  } catch (error) {
+    console.error('DreamFace API call failed:', error);
+    throw error;
+  }
 }
 
 async function pollDreamFaceCompletion(taskId, uuid) {
@@ -219,14 +195,31 @@ async function pollDreamFaceCompletion(taskId, uuid) {
 
   while (attempts < maxAttempts) {
     try {
-      const response = await fetch(`https://api.newportai.com/dreamface-api/task/${taskId}`, {
+      // Update the status check URL to match the async API pattern
+      const statusUrl = `https://api.newportai.com/api/async/lipsync/${taskId}`;
+      console.log(`Checking status at: ${statusUrl}`);
+      
+      const response = await fetch(statusUrl, {
+        method: 'GET',
         headers: {
-          'Authorization': `Bearer ${DREAMFACE_API_KEY}`
+          'Authorization': `Bearer ${DREAMFACE_API_KEY}`,
+          'Content-Type': 'application/json'
         }
       });
 
       if (!response.ok) {
-        throw new Error(`Status check failed: ${response.status}`);
+        console.error(`Status check failed: ${response.status}`);
+        const errorText = await response.text();
+        console.error('Status check error response:', errorText);
+        
+        // Don't throw immediately, try a few more times
+        if (attempts < 5) {
+          attempts++;
+          await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds for first few attempts
+          continue;
+        }
+        
+        throw new Error(`Status check failed: ${response.status} - ${errorText}`);
       }
 
       const status = await response.json();
@@ -234,14 +227,37 @@ async function pollDreamFaceCompletion(taskId, uuid) {
 
       // Update Supabase with current status
       await updateSupabaseRecord(uuid, {
-        status: `lipsync_${status.status}`,
+        status: `lipsync_${status.status || status.state || 'processing'}`,
         dreamface_task_id: taskId
       });
 
-      if (status.status === 'completed' && status.resultUrl) {
-        return status.resultUrl;
-      } else if (status.status === 'failed') {
-        throw new Error(`DreamFace processing failed: ${status.error || 'Unknown error'}`);
+      // Handle different possible success indicators
+      const isCompleted = status.status === 'completed' || 
+                         status.status === 'success' || 
+                         status.state === 'completed' ||
+                         status.state === 'success';
+                         
+      const resultUrl = status.resultUrl || 
+                       status.result_url || 
+                       status.videoUrl || 
+                       status.video_url ||
+                       status.outputUrl ||
+                       status.output_url;
+
+      if (isCompleted && resultUrl) {
+        console.log(`Task completed! Result URL: ${resultUrl}`);
+        return resultUrl;
+      }
+      
+      // Handle failure cases
+      const isFailed = status.status === 'failed' || 
+                      status.status === 'error' ||
+                      status.state === 'failed' ||
+                      status.state === 'error';
+                      
+      if (isFailed) {
+        const errorMessage = status.error || status.errorMessage || status.message || 'Unknown error';
+        throw new Error(`DreamFace processing failed: ${errorMessage}`);
       }
 
       // Wait 5 seconds before next check
@@ -253,14 +269,15 @@ async function pollDreamFaceCompletion(taskId, uuid) {
       attempts++;
       
       if (attempts >= maxAttempts) {
-        throw new Error('DreamFace processing timeout');
+        throw new Error('DreamFace processing timeout - please check your task manually');
       }
       
+      // Wait before retry
       await new Promise(resolve => setTimeout(resolve, 5000));
     }
   }
 
-  throw new Error('DreamFace processing timeout - please check your task manually');
+  throw new Error('DreamFace processing timeout - maximum attempts reached');
 }
 
 // Create base video from image
