@@ -139,9 +139,9 @@ async function callDreamFaceAPI(videoUrl, audioUrl) {
     srcVideoUrl: videoUrl,
     audioUrl: audioUrl,
     videoParams: {
-      video_width: 512,
-      video_height: 512,
-      video_enhance: 1, // Enable video enhancement
+      video_width: 0,
+      video_height: 0,
+      video_enhance: 0, // Enable video enhancement
       fps: "25" // Use 25 fps
     }
   };
