@@ -13,6 +13,10 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
+// DreamFace API configuration
+const DREAMFACE_API_KEY = process.env.DREAMFACE_API_KEY;
+const DREAMFACE_API_URL = 'https://api.newportai.com/dreamface-api/lipsync';
+
 // Configure multer for direct file uploads (fallback)
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -88,6 +92,208 @@ async function fetchFromSupabase(uuid) {
   return data[0]; // Return first matching record
 }
 
+// Helper function to update Supabase record
+async function updateSupabaseRecord(uuid, updateData) {
+  const updateUrl = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}`;
+  
+  const updateResponse = await fetch(updateUrl, {
+    method: 'PATCH',
+    headers: {
+      'apikey': SUPABASE_ANON_KEY,
+      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+      'Prefer': 'return=minimal'
+    },
+    body: JSON.stringify(updateData)
+  });
+  
+  if (!updateResponse.ok) {
+    console.warn('Failed to update Supabase record:', updateResponse.status);
+    return false;
+  }
+  
+  return true;
+}
+
+// Helper function to upload file to public server (Railway static files)
+async function uploadToPublicServer(localFilePath, uuid, type) {
+  // For Railway deployment, we'll use the static file serving
+  const filename = `${type}-${uuid}-${Date.now()}${path.extname(localFilePath)}`;
+  const publicPath = path.join('./outputs', filename);
+  
+  // Copy file to public directory
+  fs.copyFileSync(localFilePath, publicPath);
+  
+  // Return the public URL
+  const baseUrl = process.env.RAILWAY_STATIC_URL || 'https://luna-user-meme-10seconds-stitching-production.up.railway.app';
+  return `${baseUrl}/downloads/${filename}`;
+}
+
+// DreamFace API functions
+async function callDreamFaceAPI(videoUrl, audioUrl) {
+  if (!DREAMFACE_API_KEY) {
+    throw new Error('DREAMFACE_API_KEY environment variable is required');
+  }
+
+  const requestBody = {
+    srcVideoUrl: videoUrl,
+    audioUrl: audioUrl,
+    videoParams: {
+      video_width: 512,
+      video_height: 512,
+      video_enhance: 1, // Enable video enhancement
+      fps: "25" // Use 25 fps
+    }
+  };
+
+  console.log('Calling DreamFace API with:', requestBody);
+
+  const response = await fetch(DREAMFACE_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${DREAMFACE_API_KEY}`
+    },
+    body: JSON.stringify(requestBody)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`DreamFace API error: ${response.status} - ${errorText}`);
+  }
+
+  const result = await response.json();
+  console.log('DreamFace API response:', result);
+
+  if (!result.taskId) {
+    throw new Error('No taskId received from DreamFace API');
+  }
+
+  return result;
+}
+
+async function pollDreamFaceCompletion(taskId, uuid) {
+  const maxAttempts = 120; // 10 minutes max (5 second intervals)
+  let attempts = 0;
+
+  while (attempts < maxAttempts) {
+    try {
+      const response = await fetch(`https://api.newportai.com/dreamface-api/task/${taskId}`, {
+        headers: {
+          'Authorization': `Bearer ${DREAMFACE_API_KEY}`
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Status check failed: ${response.status}`);
+      }
+
+      const status = await response.json();
+      console.log(`Task ${taskId} status:`, status);
+
+      // Update Supabase with current status
+      await updateSupabaseRecord(uuid, {
+        status: `lipsync_${status.status}`,
+        dreamface_task_id: taskId
+      });
+
+      if (status.status === 'completed' && status.resultUrl) {
+        return status.resultUrl;
+      } else if (status.status === 'failed') {
+        throw new Error(`DreamFace processing failed: ${status.error || 'Unknown error'}`);
+      }
+
+      // Wait 5 seconds before next check
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      attempts++;
+
+    } catch (error) {
+      console.error('Status check error:', error);
+      attempts++;
+      
+      if (attempts >= maxAttempts) {
+        throw new Error('DreamFace processing timeout');
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
+  }
+
+  throw new Error('DreamFace processing timeout - please check your task manually');
+}
+
+// Create base video from image
+async function createBaseVideo(imageSource, uuid, username, tweet) {
+  const outputPath = `./temp/base-video-${uuid}.mp4`;
+  
+  return new Promise((resolve, reject) => {
+    let inputSource = imageSource;
+    
+    // If it's a URL, download it first
+    if (imageSource.startsWith('http')) {
+      const imagePath = `./temp/image-${uuid}${path.extname(imageSource) || '.jpg'}`;
+      downloadFile(imageSource, imagePath)
+        .then(() => {
+          inputSource = imagePath;
+          createVideo();
+        })
+        .catch(reject);
+    } else {
+      createVideo();
+    }
+    
+    function createVideo() {
+      ffmpeg(inputSource)
+        .inputOptions([
+          '-loop 1',
+          '-t 5' // 5 seconds duration
+        ])
+        .videoCodec('libx264')
+        .size('512x512') // Standard size for face videos
+        .fps(25)
+        .outputOptions([
+          '-pix_fmt yuv420p',
+          '-shortest'
+        ])
+        .output(outputPath)
+        .on('end', () => {
+          console.log('Base video creation completed');
+          resolve(outputPath);
+        })
+        .on('error', (err) => {
+          console.error('Base video creation error:', err);
+          reject(err);
+        })
+        .run();
+    }
+  });
+}
+
+// Extract and process audio
+async function processAudio(audioUrl, uuid) {
+  const outputPath = `./temp/processed-audio-${uuid}.mp3`;
+  
+  return new Promise((resolve, reject) => {
+    ffmpeg(audioUrl)
+      .audioCodec('mp3')
+      .duration(5) // 5 seconds
+      .audioFilters([
+        'afade=t=in:st=0:d=0.5', // Fade in for 0.5 seconds
+        'afade=t=out:st=4.5:d=0.5' // Fade out for 0.5 seconds
+      ])
+      .output(outputPath)
+      .on('end', () => {
+        console.log('Audio processing completed');
+        resolve(outputPath);
+      })
+      .on('error', (err) => {
+        console.error('Audio processing error:', err);
+        reject(err);
+      })
+      .run();
+  });
+}
+
 // Serve the index.html file at the root URL
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
@@ -97,7 +303,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-// NEW: Create video endpoint (handles form submission from web interface)
+// MODIFIED: Create video endpoint with DreamFace integration
 app.post('/api/create-video', upload.single('image'), async (req, res) => {
   try {
     const { username, tweet, imageUrl } = req.body;
@@ -112,7 +318,7 @@ app.post('/api/create-video', upload.single('image'), async (req, res) => {
       user_name: username,
       original_message: tweet,
       user_image_url: imageUrl || null,
-      status: 'pending',
+      status: 'processing_started',
       created_at: new Date().toISOString()
     };
     
@@ -130,10 +336,24 @@ app.post('/api/create-video', upload.single('image'), async (req, res) => {
       throw new Error('Failed to create video job');
     }
     
+    // Start async processing with DreamFace
+    processVideoWithDreamFace(uuid, {
+      username,
+      tweet,
+      imageFile,
+      imageUrl
+    }).catch(error => {
+      console.error('Processing error:', error);
+      updateSupabaseRecord(uuid, {
+        status: 'failed',
+        error_message: error.message
+      });
+    });
+    
     res.json({
       success: true,
       uuid: uuid,
-      message: 'Video creation started'
+      message: 'Video creation started with lip sync processing'
     });
     
   } catch (error) {
@@ -144,7 +364,58 @@ app.post('/api/create-video', upload.single('image'), async (req, res) => {
   }
 });
 
-// NEW: Status check endpoint (for web interface polling)
+// NEW: Main processing function with DreamFace integration
+async function processVideoWithDreamFace(uuid, data) {
+  const { username, tweet, imageFile, imageUrl } = data;
+  
+  try {
+    // Get the record to find existing video and audio URLs
+    const record = await fetchFromSupabase(uuid);
+    const videoUrl = record.final_video_url;
+    const audioUrl = record.final_audio_file;
+
+    if (!videoUrl || !audioUrl) {
+      throw new Error('Video or audio URL missing in Supabase record');
+    }
+
+    // Step 1: Send video and audio URLs directly to DreamFace API for lip sync
+    await updateSupabaseRecord(uuid, {
+      status: 'requesting_lipsync'
+    });
+    
+    console.log('Sending to DreamFace API for lip sync...');
+    const dreamfaceResult = await callDreamFaceAPI(videoUrl, audioUrl);
+    
+    // Step 2: Poll for completion and get back the lip-synced video URL
+    await updateSupabaseRecord(uuid, {
+      status: 'waiting_for_lipsync',
+      dreamface_task_id: dreamfaceResult.taskId
+    });
+    
+    console.log('Waiting for DreamFace completion...');
+    const lipSyncedVideoUrl = await pollDreamFaceCompletion(dreamfaceResult.taskId, uuid);
+    
+    // Step 3: Update Supabase with the final lip-synced video URL
+    await updateSupabaseRecord(uuid, {
+      status: 'stitched',
+      final_stitch_video: lipSyncedVideoUrl,
+      time_completion: new Date().toISOString(),
+      dreamface_task_id: dreamfaceResult.taskId
+    });
+    
+    console.log(`Lip sync processing completed for UUID: ${uuid}`);
+    
+  } catch (error) {
+    console.error('Processing error:', error);
+    await updateSupabaseRecord(uuid, {
+      status: 'failed',
+      error_message: error.message
+    });
+    throw error;
+  }
+}
+
+// Status check endpoint (for web interface polling)
 app.get('/api/status/:uuid', async (req, res) => {
   try {
     const { uuid } = req.params;
@@ -155,7 +426,10 @@ app.get('/api/status/:uuid', async (req, res) => {
       status: record.status,
       final_stitch_video: record.final_stitch_video,
       error_message: record.error_message,
-      created_at: record.created_at
+      created_at: record.created_at,
+      dreamface_task_id: record.dreamface_task_id,
+      base_video_url: record.base_video_url,
+      processed_audio_url: record.processed_audio_url
     });
     
   } catch (error) {
@@ -166,7 +440,7 @@ app.get('/api/status/:uuid', async (req, res) => {
   }
 });
 
-// Process using Supabase UUID
+// MODIFIED: Process using Supabase UUID (simplified DreamFace integration)
 app.post('/process-uuid', async (req, res) => {
   try {
     const { uuid } = req.body;
@@ -178,7 +452,7 @@ app.post('/process-uuid', async (req, res) => {
       });
     }
 
-    console.log(`Processing UUID: ${uuid}`);
+    console.log(`Processing UUID with DreamFace: ${uuid}`);
 
     // Fetch record from Supabase
     const record = await fetchFromSupabase(uuid);
@@ -193,111 +467,36 @@ app.post('/process-uuid', async (req, res) => {
       });
     }
 
-    console.log(`Found URLs - Video: ${videoUrl}, Audio: ${audioUrl}`);
-
-    // Create temporary file paths
-    const tempVideoPath = `./temp/video-${uuid}.mp4`;
-    const tempAudioPath = `./temp/audio-${uuid}.mp3`;
-
-    // Download files
-    console.log('Downloading video file...');
-    await downloadFile(videoUrl, tempVideoPath);
-    
-    console.log('Downloading audio file...');
-    await downloadFile(audioUrl, tempAudioPath);
-
-    // Process with FFmpeg
-    const outputDir = './outputs';
-    if (!fs.existsSync(outputDir)) {
-      fs.mkdirSync(outputDir, { recursive: true });
-    }
-
-    const outputFileName = `processed-${uuid}.mp4`;
-    const outputPath = path.join(outputDir, outputFileName);
-
-    console.log('Starting FFmpeg processing...');
-
-    await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(tempVideoPath)
-        .input(tempAudioPath)
-        .complexFilter([
-          '[1:a]atrim=0:5,afade=in:st=0:d=0.5,afade=out:st=4.5:d=0.5[audio_processed]'
-        ])
-        .outputOptions([
-          '-map 0:v',
-          '-map [audio_processed]',
-          '-c:v copy',
-          '-c:a aac',
-          '-b:a 128k'
-        ])
-        .output(outputPath)
-        .on('start', (commandLine) => {
-          console.log('FFmpeg command:', commandLine);
-        })
-        .on('progress', (progress) => {
-          console.log(`Processing: ${Math.round(progress.percent || 0)}% done`);
-        })
-        .on('end', () => {
-          console.log('Processing completed successfully');
-          resolve();
-        })
-        .on('error', (err) => {
-          console.error('FFmpeg error:', err.message);
-          reject(err);
-        })
-        .run();
+    // Step 1: Send existing video and audio URLs directly to DreamFace API
+    await updateSupabaseRecord(uuid, {
+      status: 'requesting_lipsync'
     });
 
-    // Clean up temporary files
-    try {
-      fs.unlinkSync(tempVideoPath);
-      fs.unlinkSync(tempAudioPath);
-    } catch (e) {
-      console.warn('Could not clean up temp files:', e.message);
-    }
+    console.log(`Sending to DreamFace - Video: ${videoUrl}, Audio: ${audioUrl}`);
+    const dreamfaceResult = await callDreamFaceAPI(videoUrl, audioUrl);
+    
+    // Step 2: Poll for completion and get the lip-synced video URL
+    await updateSupabaseRecord(uuid, {
+      status: 'waiting_for_lipsync',
+      dreamface_task_id: dreamfaceResult.taskId
+    });
 
-    // Get file stats
-    const stats = fs.statSync(outputPath);
-    const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+    const lipSyncedVideoUrl = await pollDreamFaceCompletion(dreamfaceResult.taskId, uuid);
 
-    // Create the complete download URL
-    const completeDownloadUrl = `https://luna-user-meme-10seconds-stitching-production.up.railway.app/downloads/${outputFileName}`;
-
-    // Update the Supabase record with the final stitched video URL
-    try {
-      const updateUrl = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}`;
-      const updateResponse = await fetch(updateUrl, {
-        method: 'PATCH',
-        headers: {
-          'apikey': SUPABASE_ANON_KEY,
-          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-          'Content-Type': 'application/json',
-          'Prefer': 'return=minimal'
-        },
-        body: JSON.stringify({
-          final_stitch_video: completeDownloadUrl,
-          status: 'stitched',
-          time_completion: new Date().toISOString()
-        })
-      });
-      
-      if (!updateResponse.ok) {
-        console.warn('Failed to update Supabase record:', updateResponse.status);
-      } else {
-        console.log('Successfully updated Supabase with final stitched video URL');
-      }
-    } catch (updateError) {
-      console.warn('Error updating Supabase record:', updateError.message);
-    }
+    // Step 3: Update Supabase with the final lip-synced video URL
+    await updateSupabaseRecord(uuid, {
+      status: 'stitched',
+      final_stitch_video: lipSyncedVideoUrl,
+      time_completion: new Date().toISOString(),
+      dreamface_task_id: dreamfaceResult.taskId
+    });
 
     res.json({
       success: true,
-      message: 'Video processed successfully from Supabase record',
+      message: 'Video processed successfully with DreamFace lip sync',
       uuid: uuid,
-      downloadUrl: completeDownloadUrl,
-      final_stitch_video: completeDownloadUrl,
-      fileSize: `${fileSizeMB} MB`,
+      final_stitch_video: lipSyncedVideoUrl,
+      dreamface_task_id: dreamfaceResult.taskId,
       originalRecord: {
         videoUrl: videoUrl,
         audioUrl: audioUrl
@@ -310,19 +509,9 @@ app.post('/process-uuid', async (req, res) => {
     
     // Update Supabase with error status
     try {
-      const updateUrl = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${req.body.uuid}`;
-      await fetch(updateUrl, {
-        method: 'PATCH',
-        headers: {
-          'apikey': SUPABASE_ANON_KEY,
-          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-          'Content-Type': 'application/json',
-          'Prefer': 'return=minimal'
-        },
-        body: JSON.stringify({
-          status: 'failed',
-          error_message: error.message
-        })
+      await updateSupabaseRecord(req.body.uuid, {
+        status: 'failed',
+        error_message: error.message
       });
     } catch (updateError) {
       console.warn('Failed to update error status in Supabase:', updateError.message);
@@ -336,7 +525,7 @@ app.post('/process-uuid', async (req, res) => {
   }
 });
 
-// Direct file upload endpoint
+// Direct file upload endpoint (keeping original functionality)
 app.post('/process', upload.fields([
   { name: 'video', maxCount: 1 },
   { name: 'audio', maxCount: 1 }
@@ -361,7 +550,7 @@ app.post('/process', upload.fields([
 
     console.log(`Processing files: ${videoFile.filename} + ${audioFile.filename}`);
 
-    // Process with FFmpeg
+    // Process with FFmpeg (original functionality)
     await new Promise((resolve, reject) => {
       ffmpeg()
         .input(videoFile.path)
@@ -430,13 +619,14 @@ app.post('/process', upload.fields([
   }
 });
 
-// Debug endpoint to test Supabase connection
+// All your existing debug endpoints remain the same...
 app.get('/debug-supabase/:uuid', async (req, res) => {
   try {
     const { uuid } = req.params;
     
     console.log('SUPABASE_URL:', SUPABASE_URL);
     console.log('SUPABASE_ANON_KEY exists:', !!SUPABASE_ANON_KEY);
+    console.log('DREAMFACE_API_KEY exists:', !!DREAMFACE_API_KEY);
     console.log('Looking for UUID:', uuid);
     
     const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}&select=*`;
@@ -457,6 +647,7 @@ app.get('/debug-supabase/:uuid', async (req, res) => {
     res.json({
       supabaseUrl: SUPABASE_URL,
       hasAnonymousKey: !!SUPABASE_ANON_KEY,
+      hasDreamfaceKey: !!DREAMFACE_API_KEY,
       queryUrl: url,
       responseStatus: response.status,
       data: data,
@@ -472,7 +663,7 @@ app.get('/debug-supabase/:uuid', async (req, res) => {
   }
 });
 
-// Find records with video/audio files
+// Keep all other existing debug endpoints...
 app.get('/debug-find-complete-records', async (req, res) => {
   try {
     const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs?select=uuid,final_video_url,final_audio_file&final_video_url=not.is.null&final_audio_file=not.is.null&limit=5`;
@@ -494,7 +685,6 @@ app.get('/debug-find-complete-records', async (req, res) => {
   }
 });
 
-// Enhanced debug endpoint to test different query approaches
 app.get('/debug-supabase-enhanced/:uuid', async (req, res) => {
   try {
     const { uuid } = req.params;
@@ -543,7 +733,6 @@ app.get('/debug-supabase-enhanced/:uuid', async (req, res) => {
   }
 });
 
-// Test basic table access
 app.get('/debug-table-access', async (req, res) => {
   try {
     // Test 1: Get total count
@@ -617,9 +806,12 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 app.listen(PORT, () => {
-  console.log(`🚀 Video Processing API running on port ${PORT}`);
+  console.log(`🚀 Video Processing API with DreamFace Lip Sync running on port ${PORT}`);
   console.log(`🎬 Web Interface: https://luna-user-meme-10seconds-stitching-production.up.railway.app`);
   console.log(`📁 Direct upload: POST /process`);
-  console.log(`🆔 UUID processing: POST /process-uuid`);
+  console.log(`🆔 UUID processing with DreamFace: POST /process-uuid`);
+  console.log(`🎭 New video creation with lip sync: POST /api/create-video`);
+  console.log(`📊 Status check: GET /api/status/:uuid`);
   console.log(`🔗 Health check: GET /health`);
+  console.log(`🔑 DreamFace API: ${DREAMFACE_API_KEY ? 'Configured' : 'Missing API Key'}`);
 });
