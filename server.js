@@ -15,7 +15,7 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
 // DreamFace API configuration
 const DREAMFACE_API_KEY = process.env.DREAMFACE_API_KEY;
-const DREAMFACE_API_URL = 'https://api.newportai.com/dreamface-api/lipsync';
+const DREAMFACE_API_URL = 'https://api.newportai.com/v1/lipsync'; // Try this endpoint first
 
 // Configure multer for direct file uploads (fallback)
 const storage = multer.diskStorage({
@@ -139,37 +139,78 @@ async function callDreamFaceAPI(videoUrl, audioUrl) {
     srcVideoUrl: videoUrl,
     audioUrl: audioUrl,
     videoParams: {
-      video_width: 0,
-      video_height: 0,
-      video_enhance: 0, // Enable video enhancement
-      fps: "25" // Use 25 fps
+      video_width: 512,     // Fixed size instead of 0
+      video_height: 512,    // Fixed size instead of 0  
+      video_enhance: 1,     // Enable enhancement (was 0)
+      fps: "25"
     }
   };
 
   console.log('Calling DreamFace API with:', requestBody);
 
-  const response = await fetch(DREAMFACE_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${DREAMFACE_API_KEY}`
-    },
-    body: JSON.stringify(requestBody)
-  });
+  // Try multiple possible endpoints
+  const possibleEndpoints = [
+    'https://api.newportai.com/v1/lipsync',
+    'https://api.newportai.com/lipsync',
+    'https://api.newportai.com/dreamface/lipsync',
+    'https://api.newportai.com/api/v1/lipsync'
+  ];
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`DreamFace API error: ${response.status} - ${errorText}`);
+  let lastError;
+  
+  for (const endpoint of possibleEndpoints) {
+    try {
+      console.log(`Trying endpoint: ${endpoint}`);
+      
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${DREAMFACE_API_KEY}`,
+          'User-Agent': 'Luna-Video-Processor/1.0'
+        },
+        body: JSON.stringify(requestBody)
+      });
+
+      console.log(`Response status: ${response.status}`);
+      
+      if (response.status === 405) {
+        console.log(`405 Method Not Allowed for ${endpoint}, trying next...`);
+        continue;
+      }
+      
+      if (response.status === 404) {
+        console.log(`404 Not Found for ${endpoint}, trying next...`);
+        continue;
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.log(`Error response: ${errorText}`);
+        lastError = new Error(`API error ${response.status}: ${errorText}`);
+        continue;
+      }
+
+      const result = await response.json();
+      console.log('DreamFace API success response:', result);
+
+      if (!result.taskId && !result.task_id && !result.id) {
+        throw new Error('No task ID received from DreamFace API');
+      }
+
+      return {
+        taskId: result.taskId || result.task_id || result.id,
+        endpoint: endpoint
+      };
+
+    } catch (error) {
+      console.error(`Error with endpoint ${endpoint}:`, error.message);
+      lastError = error;
+      continue;
+    }
   }
 
-  const result = await response.json();
-  console.log('DreamFace API response:', result);
-
-  if (!result.taskId) {
-    throw new Error('No taskId received from DreamFace API');
-  }
-
-  return result;
+  throw lastError || new Error('All DreamFace API endpoints failed');
 }
 
 async function pollDreamFaceCompletion(taskId, uuid) {
