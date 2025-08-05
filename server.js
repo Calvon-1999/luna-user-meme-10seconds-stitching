@@ -135,14 +135,15 @@ async function callDreamFaceAPI(videoUrl, audioUrl) {
     throw new Error('DREAMFACE_API_KEY environment variable is required');
   }
 
+  // Use the exact format from their documentation
   const requestBody = {
     srcVideoUrl: videoUrl,
     audioUrl: audioUrl,
     videoParams: {
-      video_width: 512,
-      video_height: 512,
-      video_enhance: 1,
-      fps: "25"
+      video_width: 0,        // Keep original width (as per their docs)
+      video_height: 0,       // Keep original height (as per their docs)
+      video_enhance: 1       // Enable enhancement
+      // Note: fps is not in their example, so removing it
     }
   };
 
@@ -170,14 +171,8 @@ async function callDreamFaceAPI(videoUrl, audioUrl) {
     const result = await response.json();
     console.log('DreamFace API success response:', result);
 
-    // Handle different possible response formats - the API returns taskId inside 'data' object
-    const taskId = result.taskId || 
-                  result.task_id || 
-                  result.id || 
-                  result.requestId ||
-                  (result.data && result.data.taskId) ||  // This is the correct path!
-                  (result.data && result.data.task_id) ||
-                  (result.data && result.data.id);
+    // Extract taskId from data object (as per their documentation)
+    const taskId = result.data && result.data.taskId;
     
     if (!taskId) {
       console.error('No task ID found in response:', result);
@@ -201,83 +196,108 @@ async function pollDreamFaceCompletion(taskId, uuid) {
   const maxAttempts = 120; // 10 minutes max (5 second intervals)
   let attempts = 0;
 
+  // Use the correct polling endpoint from their documentation
+  const pollingUrl = 'https://api.newportai.com/api/getAsyncResult';
+
   while (attempts < maxAttempts) {
     try {
-      // Update the status check URL to match the async API pattern
-      const statusUrl = `https://api.newportai.com/api/async/lipsync/${taskId}`;
-      console.log(`Checking status at: ${statusUrl}`);
+      console.log(`Polling task ${taskId} at: ${pollingUrl}`);
       
-      const response = await fetch(statusUrl, {
-        method: 'GET',
+      const response = await fetch(pollingUrl, {
+        method: 'POST',  // Important: POST method, not GET!
         headers: {
           'Authorization': `Bearer ${DREAMFACE_API_KEY}`,
           'Content-Type': 'application/json'
-        }
+        },
+        body: JSON.stringify({
+          taskId: taskId  // Send taskId in request body
+        })
       });
 
+      console.log(`Polling response status: ${response.status}`);
+
       if (!response.ok) {
-        console.error(`Status check failed: ${response.status}`);
         const errorText = await response.text();
-        console.error('Status check error response:', errorText);
+        console.error('Polling error response:', errorText);
         
-        // Don't throw immediately, try a few more times
+        // Don't fail immediately, retry a few times
         if (attempts < 5) {
           attempts++;
           await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds for first few attempts
           continue;
         }
         
-        throw new Error(`Status check failed: ${response.status} - ${errorText}`);
+        throw new Error(`Polling failed: ${response.status} - ${errorText}`);
       }
 
-      const status = await response.json();
-      console.log(`Task ${taskId} status:`, status);
+      const result = await response.json();
+      console.log(`Polling result:`, result);
+
+      // Check if the request was successful
+      if (result.code !== 0) {
+        throw new Error(`API returned error: ${result.message}`);
+      }
+
+      // Check task status based on their documentation
+      const task = result.data && result.data.task;
+      if (!task) {
+        console.log('No task data yet, continuing to poll...');
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        attempts++;
+        continue;
+      }
+
+      const taskStatus = task.status;
+      console.log(`Task status: ${taskStatus} (1=submitted, 2=in progress, 3=success, 4=failed)`);
 
       // Update Supabase with current status
-      await updateSupabaseRecord(uuid, {
-        status: `lipsync_${status.status || status.state || 'processing'}`,
-        dreamface_task_id: taskId
-      });
+      try {
+        let statusText = 'lipsync_processing';
+        switch(taskStatus) {
+          case 1: statusText = 'lipsync_submitted'; break;
+          case 2: statusText = 'lipsync_in_progress'; break;
+          case 3: statusText = 'lipsync_success'; break;
+          case 4: statusText = 'lipsync_failed'; break;
+        }
+        
+        await updateSupabaseRecord(uuid, {
+          status: statusText,
+          dreamface_task_id: taskId
+        });
+      } catch (updateError) {
+        console.warn('Supabase update failed, continuing...', updateError.message);
+      }
 
-      // Handle different possible success indicators
-      const isCompleted = status.status === 'completed' || 
-                         status.status === 'success' || 
-                         status.state === 'completed' ||
-                         status.state === 'success';
-                         
-      const resultUrl = status.resultUrl || 
-                       status.result_url || 
-                       status.videoUrl || 
-                       status.video_url ||
-                       status.outputUrl ||
-                       status.output_url;
-
-      if (isCompleted && resultUrl) {
-        console.log(`Task completed! Result URL: ${resultUrl}`);
-        return resultUrl;
+      // Handle task completion (status = 3)
+      if (taskStatus === 3) {
+        // Task successful - extract video URL
+        const videos = result.data.videos;
+        if (videos && videos.length > 0 && videos[0].videoUrl) {
+          const resultUrl = videos[0].videoUrl;
+          console.log(`Task completed successfully! Result URL: ${resultUrl}`);
+          return resultUrl;
+        } else {
+          throw new Error('Task completed but no video URL found in response');
+        }
       }
       
-      // Handle failure cases
-      const isFailed = status.status === 'failed' || 
-                      status.status === 'error' ||
-                      status.state === 'failed' ||
-                      status.state === 'error';
-                      
-      if (isFailed) {
-        const errorMessage = status.error || status.errorMessage || status.message || 'Unknown error';
-        throw new Error(`DreamFace processing failed: ${errorMessage}`);
+      // Handle task failure (status = 4)
+      if (taskStatus === 4) {
+        const reason = task.reason || 'Unknown error';
+        throw new Error(`DreamFace processing failed: ${reason}`);
       }
 
-      // Wait 5 seconds before next check
+      // Task is still in progress (status = 1 or 2), continue polling
+      console.log('Task still in progress, waiting 5 seconds before next poll...');
       await new Promise(resolve => setTimeout(resolve, 5000));
       attempts++;
 
     } catch (error) {
-      console.error('Status check error:', error);
+      console.error('Polling error:', error);
       attempts++;
       
       if (attempts >= maxAttempts) {
-        throw new Error('DreamFace processing timeout - please check your task manually');
+        throw new Error('DreamFace processing timeout - maximum attempts reached');
       }
       
       // Wait before retry
