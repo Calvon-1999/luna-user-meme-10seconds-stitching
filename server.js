@@ -170,13 +170,21 @@ async function callDreamFaceAPI(videoUrl, audioUrl) {
     const result = await response.json();
     console.log('DreamFace API success response:', result);
 
-    // Handle different possible response formats
-    const taskId = result.taskId || result.task_id || result.id || result.requestId;
+    // Handle different possible response formats - the API returns taskId inside 'data' object
+    const taskId = result.taskId || 
+                  result.task_id || 
+                  result.id || 
+                  result.requestId ||
+                  (result.data && result.data.taskId) ||  // This is the correct path!
+                  (result.data && result.data.task_id) ||
+                  (result.data && result.data.id);
     
     if (!taskId) {
       console.error('No task ID found in response:', result);
       throw new Error('No task ID received from DreamFace API');
     }
+
+    console.log('Extracted task ID:', taskId);
 
     return {
       taskId: taskId,
