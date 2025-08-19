@@ -9,17 +9,15 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Supabase configuration
+// Supabase config
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
-// Configure multer for file uploads
+// Multer storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const uploadDir = './uploads';
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
+    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
@@ -27,10 +25,7 @@ const storage = multer.diskStorage({
     cb(null, uniqueName);
   }
 });
-const upload = multer({
-  storage,
-  limits: { fileSize: 100 * 1024 * 1024 }
-});
+const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
 
 // Ensure dirs
 ['./uploads', './outputs', './temp'].forEach(dir => {
@@ -41,41 +36,67 @@ app.use(express.json());
 app.use('/downloads', express.static('outputs'));
 
 // Helpers
+async function fetchFromSupabase(uuid) {
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}&select=*`, {
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json'
+    }
+  });
+  if (!response.ok) throw new Error(`Supabase fetch failed: ${response.statusText}`);
+  return response.json();
+}
+
+async function insertOrUpdateSupabase(uuid, data) {
+  const existing = await fetchFromSupabase(uuid);
+  if (existing.length) {
+    // update instead
+    const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}`;
+    await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(data)
+    });
+  } else {
+    // insert new
+    const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs`;
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ uuid, ...data })
+    });
+  }
+}
+
+async function updateSupabaseRecord(uuid, updateData) {
+  const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}`;
+  await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal'
+    },
+    body: JSON.stringify(updateData)
+  });
+}
+
 async function downloadFile(url, outputPath) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Failed to download: ${response.statusText}`);
   const buffer = await response.buffer();
   fs.writeFileSync(outputPath, buffer);
   return outputPath;
-}
-
-async function fetchFromSupabase(uuid) {
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}&select=*`, {
-    headers: {
-      'apikey': SUPABASE_ANON_KEY,
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json'
-    }
-  });
-  if (!response.ok) throw new Error(`Supabase fetch failed: ${response.statusText}`);
-  const data = await response.json();
-  if (!data.length) throw new Error(`No record for UUID: ${uuid}`);
-  return data[0];
-}
-
-async function updateSupabaseRecord(uuid, updateData) {
-  const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}`;
-  const response = await fetch(url, {
-    method: 'PATCH',
-    headers: {
-      'apikey': SUPABASE_ANON_KEY,
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json',
-      'Prefer': 'return=minimal'
-    },
-    body: JSON.stringify(updateData)
-  });
-  return response.ok;
 }
 
 async function uploadToPublicServer(localFilePath, uuid, type) {
@@ -86,30 +107,25 @@ async function uploadToPublicServer(localFilePath, uuid, type) {
   return `${baseUrl}/downloads/${filename}`;
 }
 
-// 🔥 Core function: Merge Video + Music
 async function mergeVideoWithMusic(videoUrl, musicUrl, uuid) {
   const videoPath = `./temp/video-${uuid}.mp4`;
   const musicPath = `./temp/music-${uuid}.mp3`;
   const outputPath = `./outputs/final-${uuid}.mp4`;
 
-  // Download files
   await downloadFile(videoUrl, videoPath);
   await downloadFile(musicUrl, musicPath);
 
-  // Get video duration
   const videoDuration = await new Promise((resolve, reject) => {
     ffmpeg.ffprobe(videoPath, (err, metadata) => {
       if (err) return reject(err);
       resolve(metadata.format.duration);
     });
   });
-  console.log(`🎥 Video duration: ${videoDuration}s`);
 
-  // Process music to match duration
   const processedMusicPath = `./temp/processed-music-${uuid}.mp3`;
   await new Promise((resolve, reject) => {
     ffmpeg(musicPath)
-      .inputOptions(['-stream_loop -1']) // loop if shorter
+      .inputOptions(['-stream_loop -1'])
       .audioFilters([
         `atrim=0:${videoDuration}`,
         `afade=t=out:st=${Math.max(0, videoDuration - 2)}:d=2`
@@ -120,7 +136,6 @@ async function mergeVideoWithMusic(videoUrl, musicUrl, uuid) {
       .run();
   });
 
-  // Merge
   await new Promise((resolve, reject) => {
     ffmpeg(videoPath)
       .input(processedMusicPath)
@@ -134,10 +149,11 @@ async function mergeVideoWithMusic(videoUrl, musicUrl, uuid) {
   return outputPath;
 }
 
-// Endpoints
+// Routes
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (req, res) => res.json({ status: 'healthy', time: new Date().toISOString() }));
 
+// 🔥 Main job
 app.post('/api/create-video', async (req, res) => {
   try {
     const { username, tweet, final_stitch_video, final_music_url, uuid: clientUuid } = req.body;
@@ -145,29 +161,17 @@ app.post('/api/create-video', async (req, res) => {
       return res.status(400).json({ error: 'final_stitch_video and final_music_url required' });
     }
 
-    // Use client-provided UUID if given, otherwise generate new
     const uuid = clientUuid || uuidv4();
 
-    const insertUrl = `${SUPABASE_URL}/rest/v1/luna-user-jobs`;
-    const insertData = {
-      uuid,
+    // Ensure record exists with client-provided UUID
+    await insertOrUpdateSupabase(uuid, {
       user_name: username || null,
       original_message: tweet || null,
       status: 'processing_started',
       created_at: new Date().toISOString()
-    };
-
-    await fetch(insertUrl, {
-      method: 'POST',
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(insertData)
     });
 
-    // Process async
+    // Async processing
     (async () => {
       try {
         await updateSupabaseRecord(uuid, { status: 'merging_audio' });
@@ -191,31 +195,7 @@ app.post('/api/create-video', async (req, res) => {
   }
 });
 
-    // Process async
-    (async () => {
-      try {
-        await updateSupabaseRecord(uuid, { status: 'merging_audio' });
-        const finalPath = await mergeVideoWithMusic(final_stitch_video, final_music_url, uuid);
-        const publicUrl = await uploadToPublicServer(finalPath, uuid, 'merged');
-        await updateSupabaseRecord(uuid, {
-          status: 'completed',
-          final_merged_video: publicUrl,
-          time_completion: new Date().toISOString()
-        });
-        console.log(`✅ Job ${uuid} completed`);
-      } catch (err) {
-        console.error('Async processing failed:', err);
-        await updateSupabaseRecord(uuid, { status: 'failed', error_message: err.message });
-      }
-    })();
-
-    res.json({ success: true, uuid, message: 'Job started' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ✅ Standalone merge endpoint
+// Simple merge endpoint
 app.post('/merge-video-music', async (req, res) => {
   try {
     const { final_stitch_video, final_music_url } = req.body;
@@ -225,23 +205,24 @@ app.post('/merge-video-music', async (req, res) => {
     const uuid = uuidv4();
     const finalPath = await mergeVideoWithMusic(final_stitch_video, final_music_url, uuid);
     const publicUrl = await uploadToPublicServer(finalPath, uuid, 'merged');
-    res.json({ success: true, merged_video: publicUrl, processedAt: new Date().toISOString() });
+    res.json({ success: true, merged_video: publicUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Status
+// Status endpoint
 app.get('/api/status/:uuid', async (req, res) => {
   try {
     const record = await fetchFromSupabase(req.params.uuid);
-    res.json(record);
+    if (!record.length) return res.status(404).json({ error: 'Not found' });
+    res.json(record[0]);
   } catch (err) {
-    res.status(404).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Cleanup old files hourly
+// Cleanup
 setInterval(() => {
   const now = Date.now();
   const oneHour = 60 * 60 * 1000;
