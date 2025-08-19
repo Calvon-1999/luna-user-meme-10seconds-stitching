@@ -9,88 +9,18 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Supabase config
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-
-// Multer storage
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = './uploads';
-    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueName = `${uuidv4()}-${file.originalname}`;
-    cb(null, uniqueName);
-  }
-});
-const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
+app.use(express.json());
+app.use('/downloads', express.static('outputs'));
 
 // Ensure dirs
 ['./uploads', './outputs', './temp'].forEach(dir => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-app.use(express.json());
-app.use('/downloads', express.static('outputs'));
+// ----------------- 🔥 In-memory job store -----------------
+const jobs = {};
 
-// Helpers
-async function fetchFromSupabase(uuid) {
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}&select=*`, {
-    headers: {
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json'
-    }
-  });
-  if (!response.ok) throw new Error(`Supabase fetch failed: ${response.statusText}`);
-  return response.json();
-}
-
-async function insertOrUpdateSupabase(uuid, data) {
-  const existing = await fetchFromSupabase(uuid);
-  if (existing.length) {
-    // update instead
-    const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}`;
-    await fetch(url, {
-      method: 'PATCH',
-      headers: {
-        apikey: SUPABASE_ANON_KEY,
-        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(data)
-    });
-  } else {
-    // insert new
-    const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs`;
-    await fetch(url, {
-      method: 'POST',
-      headers: {
-        apikey: SUPABASE_ANON_KEY,
-        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ uuid, ...data })
-    });
-  }
-}
-
-async function updateSupabaseRecord(uuid, updateData) {
-  const url = `${SUPABASE_URL}/rest/v1/luna-user-jobs?uuid=eq.${uuid}`;
-  await fetch(url, {
-    method: 'PATCH',
-    headers: {
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal'
-    },
-    body: JSON.stringify(updateData)
-  });
-}
-
+// ----------------- Helpers -----------------
 async function downloadFile(url, outputPath) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Failed to download: ${response.statusText}`);
@@ -149,80 +79,50 @@ async function mergeVideoWithMusic(videoUrl, musicUrl, uuid) {
   return outputPath;
 }
 
-// Routes
+// ----------------- Routes -----------------
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (req, res) => res.json({ status: 'healthy', time: new Date().toISOString() }));
 
-// 🔥 Main job
+// POST -> start merge job
 app.post('/api/create-video', async (req, res) => {
-  try {
-    const { username, tweet, final_stitch_video, final_music_url, uuid: clientUuid } = req.body;
-    if (!final_stitch_video || !final_music_url) {
-      return res.status(400).json({ error: 'final_stitch_video and final_music_url required' });
+  const { uuid: clientUuid, final_stitch_video, final_music_url } = req.body;
+
+  if (!final_stitch_video || !final_music_url) {
+    return res.status(400).json({ error: "final_stitch_video and final_music_url required" });
+  }
+
+  const uuid = clientUuid || uuidv4();
+
+  // Mark job as processing
+  jobs[uuid] = { status: "processing", final_merged_video: null };
+
+  // Run async merge job
+  (async () => {
+    try {
+      const finalPath = await mergeVideoWithMusic(final_stitch_video, final_music_url, uuid);
+      const publicUrl = await uploadToPublicServer(finalPath, uuid, 'merged');
+
+      jobs[uuid] = { status: "completed", final_merged_video: publicUrl };
+      console.log(`✅ Job ${uuid} completed: ${publicUrl}`);
+    } catch (err) {
+      console.error(`❌ Job ${uuid} failed:`, err);
+      jobs[uuid] = { status: "failed", error: err.message };
     }
+  })();
 
-    const uuid = clientUuid || uuidv4();
-
-    // Ensure record exists with client-provided UUID
-    await insertOrUpdateSupabase(uuid, {
-      user_name: username || null,
-      original_message: tweet || null,
-      status: 'processing_started',
-      created_at: new Date().toISOString()
-    });
-
-    // Async processing
-    (async () => {
-      try {
-        await updateSupabaseRecord(uuid, { status: 'merging_audio' });
-        const finalPath = await mergeVideoWithMusic(final_stitch_video, final_music_url, uuid);
-        const publicUrl = await uploadToPublicServer(finalPath, uuid, 'merged');
-        await updateSupabaseRecord(uuid, {
-          status: 'completed',
-          final_merged_video: publicUrl,
-          time_completion: new Date().toISOString()
-        });
-        console.log(`✅ Job ${uuid} completed`);
-      } catch (err) {
-        console.error('Async processing failed:', err);
-        await updateSupabaseRecord(uuid, { status: 'failed', error_message: err.message });
-      }
-    })();
-
-    res.json({ success: true, uuid, message: 'Job started' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  res.json({ uuid, status: "processing" });
 });
 
-// Simple merge endpoint
-app.post('/merge-video-music', async (req, res) => {
-  try {
-    const { final_stitch_video, final_music_url } = req.body;
-    if (!final_stitch_video || !final_music_url) {
-      return res.status(400).json({ error: 'Both URLs required' });
-    }
-    const uuid = uuidv4();
-    const finalPath = await mergeVideoWithMusic(final_stitch_video, final_music_url, uuid);
-    const publicUrl = await uploadToPublicServer(finalPath, uuid, 'merged');
-    res.json({ success: true, merged_video: publicUrl });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+// GET -> check job status
+app.get('/api/status/:uuid', (req, res) => {
+  const { uuid } = req.params;
+  if (!jobs[uuid]) {
+    return res.status(404).json({ error: "Job not found" });
   }
+  res.json(jobs[uuid]);
 });
 
-// Status endpoint
-app.get('/api/status/:uuid', async (req, res) => {
-  try {
-    const record = await fetchFromSupabase(req.params.uuid);
-    if (!record.length) return res.status(404).json({ error: 'Not found' });
-    res.json(record[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Cleanup
+// ----------------- Cleanup -----------------
 setInterval(() => {
   const now = Date.now();
   const oneHour = 60 * 60 * 1000;
