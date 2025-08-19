@@ -33,9 +33,14 @@ async function uploadToPublicServer(localFilePath, uuid, type) {
   const filename = `${type}-${uuid}-${Date.now()}${path.extname(localFilePath)}`;
   const publicPath = path.join('./outputs', filename);
   fs.copyFileSync(localFilePath, publicPath);
+
+  // ✅ Force HTTPS with Railway domain
   const baseUrl = process.env.RAILWAY_STATIC_URL || `http://localhost:${PORT}`;
-  return `${baseUrl}/downloads/${filename}`;
+  const protocolFixed = baseUrl.startsWith('http') ? baseUrl : `https://${baseUrl}`;
+
+  return `${protocolFixed}/downloads/${filename}`;
 }
+
 
 async function mergeVideoWithMusic(videoUrl, musicUrl, uuid) {
   const videoPath = `./temp/video-${uuid}.mp4`;
