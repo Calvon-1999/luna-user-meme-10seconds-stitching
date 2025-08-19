@@ -138,15 +138,16 @@ async function mergeVideoWithMusic(videoUrl, musicUrl, uuid) {
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (req, res) => res.json({ status: 'healthy', time: new Date().toISOString() }));
 
-// ✅ Main endpoint: Create video job
 app.post('/api/create-video', async (req, res) => {
   try {
-    const { username, tweet, final_stitch_video, final_music_url } = req.body;
+    const { username, tweet, final_stitch_video, final_music_url, uuid: clientUuid } = req.body;
     if (!final_stitch_video || !final_music_url) {
       return res.status(400).json({ error: 'final_stitch_video and final_music_url required' });
     }
 
-    const uuid = uuidv4();
+    // Use client-provided UUID if given, otherwise generate new
+    const uuid = clientUuid || uuidv4();
+
     const insertUrl = `${SUPABASE_URL}/rest/v1/luna-user-jobs`;
     const insertData = {
       uuid,
@@ -155,6 +156,7 @@ app.post('/api/create-video', async (req, res) => {
       status: 'processing_started',
       created_at: new Date().toISOString()
     };
+
     await fetch(insertUrl, {
       method: 'POST',
       headers: {
@@ -164,6 +166,30 @@ app.post('/api/create-video', async (req, res) => {
       },
       body: JSON.stringify(insertData)
     });
+
+    // Process async
+    (async () => {
+      try {
+        await updateSupabaseRecord(uuid, { status: 'merging_audio' });
+        const finalPath = await mergeVideoWithMusic(final_stitch_video, final_music_url, uuid);
+        const publicUrl = await uploadToPublicServer(finalPath, uuid, 'merged');
+        await updateSupabaseRecord(uuid, {
+          status: 'completed',
+          final_merged_video: publicUrl,
+          time_completion: new Date().toISOString()
+        });
+        console.log(`✅ Job ${uuid} completed`);
+      } catch (err) {
+        console.error('Async processing failed:', err);
+        await updateSupabaseRecord(uuid, { status: 'failed', error_message: err.message });
+      }
+    })();
+
+    res.json({ success: true, uuid, message: 'Job started' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
     // Process async
     (async () => {
