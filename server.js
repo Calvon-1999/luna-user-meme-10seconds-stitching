@@ -62,7 +62,7 @@ async function mergeVideoWithMusic(videoUrl, musicUrl, uuid) {
       .audioFilters([
         `atrim=0:${videoDuration}`,
         `afade=t=out:st=${Math.max(0, videoDuration - 2)}:d=2`,
-        `volume=-2dB`
+        `volume=-10dB`
       ])
       .output(processedMusicPath)
       .on('end', resolve)
