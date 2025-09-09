@@ -561,6 +561,53 @@ app.get('/stream/:jobId', async (req, res) => {
     }
 });
 
+// Status endpoint for checking job completion
+app.get('/api/status/:jobId', async (req, res) => {
+    try {
+        const { jobId } = req.params;
+        const filePath = path.join(OUTPUT_DIR, `final_video_${jobId}.mp4`);
+        
+        try {
+            // Check if the final video exists
+            await fs.access(filePath);
+            const stats = await fs.stat(filePath);
+            const duration = await getVideoDuration(filePath);
+            
+            // Video exists - job completed successfully
+            res.json({
+                status: 'completed',
+                jobId: jobId,
+                completed: true,
+                downloadUrl: `/download/${jobId}`,
+                streamUrl: `/stream/${jobId}`,
+                finalVideoUrl: `${req.protocol}://${req.get('host')}/download/${jobId}`,
+                videoStats: {
+                    duration: duration,
+                    fileSize: stats.size,
+                    fileSizeMB: (stats.size / (1024 * 1024)).toFixed(2),
+                    createdAt: stats.birthtime
+                }
+            });
+        } catch (error) {
+            // Video doesn't exist - job might still be processing or failed
+            res.json({
+                status: 'processing',
+                jobId: jobId,
+                completed: false,
+                message: 'Video is still being processed or job not found'
+            });
+        }
+        
+    } catch (error) {
+        res.status(500).json({
+            status: 'error',
+            jobId: req.params.jobId,
+            completed: false,
+            error: error.message
+        });
+    }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({ 
