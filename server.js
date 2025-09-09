@@ -97,7 +97,37 @@ async function getVideoDimensions(videoPath) {
                 resolve({
                     width: videoStream.width,
                     height: videoStream.height
-                });
+                }
+            },
+            multipleVideos: {
+                endpoint: '/api/stitch-videos',
+                description: 'Stitch multiple videos together with audio and overlay',
+                example: {
+                    videos: [
+                        { scene_number: 1, final_video_url: 'https://...' },
+                        { scene_number: 2, final_video_url: 'https://...' }
+                    ],
+                    mv_audio: 'https://your-audio-url.mp3',
+                    overlay_image_url: 'https://your-overlay-image.png'
+                }
+            },
+            overlayPositions: ['top-left', 'top-right', 'bottom-left', 'bottom-right']
+        }
+    });
+});
+
+// Initialize and start server
+async function startServer() {
+    await ensureDirectories();
+    
+    app.listen(PORT, () => {
+        console.log(`Integrated Video Processing Service running on port ${PORT}`);
+        console.log(`Health check: http://localhost:${PORT}/health`);
+        console.log(`API documentation: http://localhost:${PORT}/`);
+    });
+}
+
+startServer().catch(console.error););
             }
         });
     });
@@ -277,6 +307,56 @@ async function addAudioAndOverlayToVideo(videoPath, audioPath, outputPath, overl
     });
 }
 
+// Add overlay to image using FFmpeg
+async function addOverlayToImage(baseImagePath, overlayImagePath, outputPath, overlayOptions = {}) {
+    return new Promise((resolve, reject) => {
+        const {
+            position = 'bottom-right',
+            size = '150',
+            margin = '20',
+            opacity = '1.0'
+        } = overlayOptions;
+        
+        let x, y;
+        switch (position) {
+            case 'top-left':
+                x = margin;
+                y = margin;
+                break;
+            case 'top-right':
+                x = `W-w-${margin}`;
+                y = margin;
+                break;
+            case 'bottom-left':
+                x = margin;
+                y = `H-h-${margin}`;
+                break;
+            case 'bottom-right':
+            default:
+                x = `W-w-${margin}`;
+                y = `H-h-${margin}`;
+                break;
+        }
+        
+        const overlayFilter = `[1:v]scale=${size}:-1[overlay]; [0:v][overlay]overlay=${x}:${y}:format=auto[out]`;
+        
+        ffmpeg(baseImagePath)
+            .input(overlayImagePath)
+            .complexFilter(overlayFilter)
+            .outputOptions(['-map', '[out]'])
+            .output(outputPath)
+            .on('end', () => {
+                console.log('Image overlay processing completed');
+                resolve();
+            })
+            .on('error', (err) => {
+                console.error('Image overlay processing error:', err);
+                reject(err);
+            })
+            .run();
+    });
+}
+
 // Endpoint for your current workflow: Single video + audio + overlay
 app.post('/api/add-overlay', async (req, res) => {
     const jobId = uuidv4();
@@ -343,6 +423,68 @@ app.post('/api/add-overlay', async (req, res) => {
 
     } catch (error) {
         console.error(`Job ${jobId} failed:`, error);
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            jobId: jobId
+        });
+    }
+});
+
+// NEW: Add overlay to image endpoint
+app.post('/api/add-image-overlay', async (req, res) => {
+    const jobId = uuidv4();
+    console.log(`Starting image overlay job ${jobId}`);
+    
+    try {
+        const { final_image_url, overlay_image_url, overlay_options } = req.body;
+        
+        if (!final_image_url || !overlay_image_url) {
+            return res.status(400).json({ 
+                error: 'Invalid input. Expected final_image_url and overlay_image_url' 
+            });
+        }
+
+        const jobDir = path.join(TEMP_DIR, jobId);
+        await fs.mkdir(jobDir, { recursive: true });
+
+        // Download base image
+        console.log('Step 1: Downloading base image...');
+        const baseImagePath = path.join(jobDir, 'base_image.png');
+        await downloadFile(final_image_url, baseImagePath);
+
+        // Download overlay image
+        console.log('Step 2: Downloading overlay image...');
+        const overlayImagePath = path.join(jobDir, 'overlay_image.png');
+        await downloadFile(overlay_image_url, overlayImagePath);
+
+        // Add overlay to image
+        console.log('Step 3: Adding overlay to image...');
+        const finalImagePath = path.join(OUTPUT_DIR, `final_image_${jobId}.png`);
+        await addOverlayToImage(baseImagePath, overlayImagePath, finalImagePath, overlay_options || {});
+
+        const stats = await fs.stat(finalImagePath);
+
+        // Cleanup temp files
+        await fs.rm(jobDir, { recursive: true, force: true });
+
+        console.log(`Image overlay job ${jobId} completed successfully`);
+
+        res.json({
+            success: true,
+            jobId: jobId,
+            downloadUrl: `/download-image/${jobId}`,
+            finalImageUrl: `${req.protocol}://${req.get('host')}/download-image/${jobId}`,
+            imageStats: {
+                fileSize: stats.size,
+                fileSizeMB: (stats.size / (1024 * 1024)).toFixed(2)
+            },
+            overlayApplied: true,
+            message: 'Successfully added overlay to image'
+        });
+
+    } catch (error) {
+        console.error(`Image overlay job ${jobId} failed:`, error);
         res.status(500).json({
             success: false,
             error: error.message,
@@ -537,6 +679,30 @@ app.get('/download/:jobId', async (req, res) => {
     }
 });
 
+// NEW: Download endpoint for processed images
+app.get('/download-image/:jobId', async (req, res) => {
+    try {
+        const { jobId } = req.params;
+        const filePath = path.join(OUTPUT_DIR, `final_image_${jobId}.png`);
+        
+        await fs.access(filePath);
+        const stats = await fs.stat(filePath);
+        
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Content-Disposition', `attachment; filename="final_image_${jobId}.png"`);
+        res.setHeader('Content-Length', stats.size);
+        
+        const fileStream = require('fs').createReadStream(filePath);
+        fileStream.pipe(res);
+        
+    } catch (error) {
+        res.status(404).json({ 
+            error: 'Image file not found or not accessible',
+            details: error.message 
+        });
+    }
+});
+
 // Stream endpoint for viewing videos in browser
 app.get('/stream/:jobId', async (req, res) => {
     try {
@@ -621,13 +787,16 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
     res.json({
         service: 'Integrated Video Processing Service',
-        version: '4.0.0',
+        version: '5.0.0',
         endpoints: {
             addOverlay: 'POST /api/add-overlay (single video + audio + overlay)',
+            addImageOverlay: 'POST /api/add-image-overlay (image + overlay)',
             stitchVideos: 'POST /api/stitch-videos (multiple videos + audio + overlay)',
             addOverlayUpload: 'POST /api/add-overlay-with-upload (multipart/form-data)',
             download: 'GET /download/:jobId (download video file)',
+            downloadImage: 'GET /download-image/:jobId (download image file)',
             stream: 'GET /stream/:jobId (stream video in browser)',
+            status: 'GET /api/status/:jobId (check job status)',
             health: 'GET /health'
         },
         usage: {
@@ -646,32 +815,15 @@ app.get('/', (req, res) => {
                     }
                 }
             },
-            multipleVideos: {
-                endpoint: '/api/stitch-videos',
-                description: 'Stitch multiple videos together with audio and overlay',
+            imageOverlay: {
+                endpoint: '/api/add-image-overlay',
+                description: 'Add overlay to an image',
                 example: {
-                    videos: [
-                        { scene_number: 1, final_video_url: 'https://...' },
-                        { scene_number: 2, final_video_url: 'https://...' }
-                    ],
-                    mv_audio: 'https://your-audio-url.mp3',
-                    overlay_image_url: 'https://your-overlay-image.png'
-                }
-            },
-            overlayPositions: ['top-left', 'top-right', 'bottom-left', 'bottom-right']
-        }
-    });
-});
-
-// Initialize and start server
-async function startServer() {
-    await ensureDirectories();
-    
-    app.listen(PORT, () => {
-        console.log(`Integrated Video Processing Service running on port ${PORT}`);
-        console.log(`Health check: http://localhost:${PORT}/health`);
-        console.log(`API documentation: http://localhost:${PORT}/`);
-    });
-}
-
-startServer().catch(console.error);
+                    final_image_url: 'https://your-generated-image.png',
+                    overlay_image_url: 'https://vdiysqfdjrthypynamgx.supabase.co/storage/v1/object/public/calvin/1757398644168-uis2fbk4d5a.png',
+                    overlay_options: {
+                        position: 'bottom-right',
+                        size: '150',
+                        margin: '20',
+                        opacity: '1.0'
+                    }
