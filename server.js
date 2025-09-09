@@ -97,37 +97,7 @@ async function getVideoDimensions(videoPath) {
                 resolve({
                     width: videoStream.width,
                     height: videoStream.height
-                }
-            },
-            multipleVideos: {
-                endpoint: '/api/stitch-videos',
-                description: 'Stitch multiple videos together with audio and overlay',
-                example: {
-                    videos: [
-                        { scene_number: 1, final_video_url: 'https://...' },
-                        { scene_number: 2, final_video_url: 'https://...' }
-                    ],
-                    mv_audio: 'https://your-audio-url.mp3',
-                    overlay_image_url: 'https://your-overlay-image.png'
-                }
-            },
-            overlayPositions: ['top-left', 'top-right', 'bottom-left', 'bottom-right']
-        }
-    });
-});
-
-// Initialize and start server
-async function startServer() {
-    await ensureDirectories();
-    
-    app.listen(PORT, () => {
-        console.log(`Integrated Video Processing Service running on port ${PORT}`);
-        console.log(`Health check: http://localhost:${PORT}/health`);
-        console.log(`API documentation: http://localhost:${PORT}/`);
-    });
-}
-
-startServer().catch(console.error););
+                });
             }
         });
     });
@@ -815,6 +785,39 @@ app.get('/', (req, res) => {
                     }
                 }
             },
+            multipleVideos: {
+                endpoint: '/api/stitch-videos',
+                description: 'Stitch multiple videos together with audio and overlay',
+                example: {
+                    videos: [
+                        { scene_number: 1, final_video_url: 'https://...' },
+                        { scene_number: 2, final_video_url: 'https://...' }
+                    ],
+                    mv_audio: 'https://your-audio-url.mp3',
+                    overlay_image_url: 'https://your-overlay-image.png'
+                }
+            },
+            overlayPositions: ['top-left', 'top-right', 'bottom-left', 'bottom-right']
+        }
+    });
+});
+
+// Initialize and start server
+async function startServer() {
+    await ensureDirectories();
+    
+    app.listen(PORT, () => {
+        console.log(`Integrated Video Processing Service running on port ${PORT}`);
+        console.log(`Health check: http://localhost:${PORT}/health`);
+        console.log(`API documentation: http://localhost:${PORT}/`);
+    });
+}
+
+startServer().catch(console.error);20',
+                        opacity: '1.0'
+                    }
+                }
+            },
             imageOverlay: {
                 endpoint: '/api/add-image-overlay',
                 description: 'Add overlay to an image',
@@ -824,6 +827,4 @@ app.get('/', (req, res) => {
                     overlay_options: {
                         position: 'bottom-right',
                         size: '150',
-                        margin: '20',
-                        opacity: '1.0'
-                    }
+                        margin: '
