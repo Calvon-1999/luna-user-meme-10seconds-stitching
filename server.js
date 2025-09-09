@@ -560,10 +560,32 @@ app.get('/download-image/:jobId', async (req, res) => {
         const filePath = path.join(OUTPUT_DIR, `final_image_${jobId}.png`);
         
         await fs.access(filePath);
+        
+        // Return URL instead of binary data
+        res.json({
+            success: true,
+            imageUrl: `${req.protocol}://${req.get('host')}/serve-image/${jobId}`,
+            jobId: jobId
+        });
+        
+    } catch (error) {
+        res.status(404).json({ 
+            error: 'Image file not found or not accessible',
+            details: error.message 
+        });
+    }
+});
+
+// Add endpoint to serve the actual image binary
+app.get('/serve-image/:jobId', async (req, res) => {
+    try {
+        const { jobId } = req.params;
+        const filePath = path.join(OUTPUT_DIR, `final_image_${jobId}.png`);
+        
+        await fs.access(filePath);
         const stats = await fs.stat(filePath);
         
         res.setHeader('Content-Type', 'image/png');
-        res.setHeader('Content-Disposition', `attachment; filename="final_image_${jobId}.png"`);
         res.setHeader('Content-Length', stats.size);
         
         const fileStream = require('fs').createReadStream(filePath);
