@@ -164,13 +164,16 @@ async function stitchVideos(videoPaths, outputPath) {
     });
 }
 
-// Add audio and overlay to video
+// Add audio and overlay to video (mix original audio with music)
 async function addAudioAndOverlayToVideo(videoPath, audioPath, outputPath, overlayImagePath = null, overlayOptions = {}) {
     return new Promise(async (resolve, reject) => {
         try {
             const command = ffmpeg(videoPath);
             
             command.input(audioPath);
+            
+            // Check if original video has audio
+            const videoHasAudio = await hasAudioStream(videoPath);
             
             if (overlayImagePath) {
                 command.input(overlayImagePath);
@@ -203,35 +206,68 @@ async function addAudioAndOverlayToVideo(videoPath, audioPath, outputPath, overl
                         break;
                 }
                 
-                const overlayFilter = `[2:v]scale=${size}:-1[overlay]; [0:v][overlay]overlay=${x}:${y}:format=auto,format=yuv420p[v]`;
-                
-                command
-                    .complexFilter(overlayFilter)
-                    .outputOptions([
-                        '-map', '[v]',
-                        '-map', '1:a:0',
-                        '-c:a', 'aac',
-                        '-shortest'
-                    ]);
+                if (videoHasAudio) {
+                    // Mix original video audio with music (music at -2dB) + video overlay
+                    const complexFilter = `[2:v]scale=${size}:-1[overlay]; [0:v][overlay]overlay=${x}:${y}:format=auto,format=yuv420p[v]; [1:a]volume=-2dB[music]; [0:a][music]amix=inputs=2:duration=shortest[mixedaudio]`;
+                    
+                    command
+                        .complexFilter(complexFilter)
+                        .outputOptions([
+                            '-map', '[v]',
+                            '-map', '[mixedaudio]',
+                            '-c:a', 'aac',
+                            '-shortest'
+                        ]);
+                } else {
+                    // No original audio, just add music + video overlay
+                    const overlayFilter = `[2:v]scale=${size}:-1[overlay]; [0:v][overlay]overlay=${x}:${y}:format=auto,format=yuv420p[v]; [1:a]volume=-2dB[music]`;
+                    
+                    command
+                        .complexFilter(overlayFilter)
+                        .outputOptions([
+                            '-map', '[v]',
+                            '-map', '[music]',
+                            '-c:a', 'aac',
+                            '-shortest'
+                        ]);
+                }
             } else {
-                command
-                    .outputOptions([
-                        '-c:v', 'copy',
-                        '-c:a', 'aac',
-                        '-map', '0:v:0',
-                        '-map', '1:a:0',
-                        '-shortest'
-                    ]);
+                // No image overlay
+                if (videoHasAudio) {
+                    // Mix original video audio with music (music at -2dB)
+                    const audioFilter = `[1:a]volume=-2dB[music]; [0:a][music]amix=inputs=2:duration=shortest[mixedaudio]`;
+                    
+                    command
+                        .complexFilter(audioFilter)
+                        .outputOptions([
+                            '-map', '0:v:0',
+                            '-map', '[mixedaudio]',
+                            '-c:v', 'copy',
+                            '-c:a', 'aac',
+                            '-shortest'
+                        ]);
+                } else {
+                    // No original audio, just add music
+                    command
+                        .complexFilter('[1:a]volume=-2dB[music]')
+                        .outputOptions([
+                            '-map', '0:v:0',
+                            '-map', '[music]',
+                            '-c:v', 'copy',
+                            '-c:a', 'aac',
+                            '-shortest'
+                        ]);
+                }
             }
 
             command
                 .output(outputPath)
                 .on('end', () => {
-                    console.log('Audio and overlay processing completed');
+                    console.log('Audio mixing and overlay processing completed');
                     resolve();
                 })
                 .on('error', (err) => {
-                    console.error('Audio and overlay processing error:', err);
+                    console.error('Audio mixing and overlay processing error:', err);
                     reject(err);
                 })
                 .run();
