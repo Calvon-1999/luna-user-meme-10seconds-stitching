@@ -290,12 +290,17 @@ async function addOverlayToImage(baseImagePath, overlayImagePath, outputPath, ov
                 break;
         }
         
-        const overlayFilter = `[1:v]scale=${size}:-1[overlay]; [0:v][overlay]overlay=${x}:${y}:format=auto[out]`;
+        // More robust filter with explicit format conversion
+        const overlayFilter = `[0:v]scale=iw:ih:force_original_aspect_ratio=decrease[base]; [1:v]scale=${size}:-1:force_original_aspect_ratio=decrease[overlay]; [base][overlay]overlay=${x}:${y}:format=rgb[out]`;
         
         ffmpeg(baseImagePath)
             .input(overlayImagePath)
             .complexFilter(overlayFilter)
-            .outputOptions(['-map', '[out]'])
+            .outputOptions([
+                '-map', '[out]',
+                '-pix_fmt', 'rgba',
+                '-f', 'png'
+            ])
             .output(outputPath)
             .on('end', () => {
                 console.log('Image overlay processing completed');
