@@ -40,7 +40,8 @@ async function downloadFile(url, filepath) {
     const response = await axios({
         method: 'GET',
         url: url,
-        responseType: 'stream'
+        responseType: 'stream',
+        timeout: 30000 // 30 second timeout
     });
 
     const writer = require('fs').createWriteStream(filepath);
@@ -240,7 +241,81 @@ async function addAudioAndOverlayToVideo(videoPath, audioPath, outputPath, overl
     });
 }
 
-// Video stitching endpoint
+// Endpoint for your current workflow: Single video + audio + overlay
+app.post('/api/add-overlay', async (req, res) => {
+    const jobId = uuidv4();
+    console.log(`Starting overlay job ${jobId}`);
+    
+    try {
+        const { final_stitch_video, final_music_url, overlay_image_url, overlay_options } = req.body;
+        
+        if (!final_stitch_video || !final_music_url) {
+            return res.status(400).json({ 
+                error: 'Invalid input. Expected final_stitch_video and final_music_url' 
+            });
+        }
+
+        const jobDir = path.join(TEMP_DIR, jobId);
+        await fs.mkdir(jobDir, { recursive: true });
+
+        // Download video
+        console.log('Step 1: Downloading video...');
+        const videoPath = path.join(jobDir, 'input_video.mp4');
+        await downloadFile(final_stitch_video, videoPath);
+
+        // Download and trim audio
+        console.log('Step 2: Processing audio...');
+        const audioPath = path.join(jobDir, 'audio.mp3');
+        const trimmedAudioPath = path.join(jobDir, 'audio_trimmed.mp3');
+        await downloadFile(final_music_url, audioPath);
+        await trimAudio(audioPath, trimmedAudioPath, 60);
+
+        // Download overlay image if provided
+        let overlayImagePath = null;
+        if (overlay_image_url) {
+            console.log('Step 3: Downloading overlay image...');
+            overlayImagePath = path.join(jobDir, 'overlay_image.png');
+            await downloadFile(overlay_image_url, overlayImagePath);
+        }
+
+        // Add audio and overlay to video
+        console.log('Step 4: Adding audio and overlay...');
+        const finalVideoPath = path.join(OUTPUT_DIR, `final_video_${jobId}.mp4`);
+        await addAudioAndOverlayToVideo(videoPath, trimmedAudioPath, finalVideoPath, overlayImagePath, overlay_options || {});
+
+        const finalDuration = await getVideoDuration(finalVideoPath);
+        const stats = await fs.stat(finalVideoPath);
+
+        // Cleanup temp files
+        await fs.rm(jobDir, { recursive: true, force: true });
+
+        console.log(`Job ${jobId} completed successfully`);
+
+        res.json({
+            success: true,
+            jobId: jobId,
+            downloadUrl: `/download/${jobId}`,
+            finalVideoUrl: `${req.protocol}://${req.get('host')}/download/${jobId}`,
+            videoStats: {
+                duration: finalDuration,
+                fileSize: stats.size,
+                fileSizeMB: (stats.size / (1024 * 1024)).toFixed(2)
+            },
+            overlayApplied: !!overlay_image_url,
+            message: 'Successfully added audio and overlay to video'
+        });
+
+    } catch (error) {
+        console.error(`Job ${jobId} failed:`, error);
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            jobId: jobId
+        });
+    }
+});
+
+// Video stitching endpoint (for multiple videos)
 app.post('/api/stitch-videos', async (req, res) => {
     const jobId = uuidv4();
     console.log(`Starting video stitching job ${jobId}`);
@@ -254,28 +329,26 @@ app.post('/api/stitch-videos', async (req, res) => {
             });
         }
 
-        // Create job-specific temp directory
         const jobDir = path.join(TEMP_DIR, jobId);
         await fs.mkdir(jobDir, { recursive: true });
 
-        // Step 1: Download and trim audio
+        // Download and trim audio
         console.log('Step 1: Processing audio...');
         const audioPath = path.join(jobDir, 'audio.mp3');
         const trimmedAudioPath = path.join(jobDir, 'audio_trimmed.mp3');
-        
         await downloadFile(mv_audio, audioPath);
         await trimAudio(audioPath, trimmedAudioPath, 60);
 
-        // Step 1.5: Download overlay image if provided
+        // Download overlay image if provided
         let overlayImagePath = null;
         if (overlay_image_url) {
-            console.log('Step 1.5: Downloading overlay image...');
+            console.log('Step 2: Downloading overlay image...');
             overlayImagePath = path.join(jobDir, 'overlay_image.png');
             await downloadFile(overlay_image_url, overlayImagePath);
         }
 
-        // Step 2: Sort and download videos
-        console.log('Step 2: Sorting and downloading videos...');
+        // Sort and download videos
+        console.log('Step 3: Sorting and downloading videos...');
         const sortedVideos = videos.sort((a, b) => {
             const sceneA = parseInt(a.scene_number, 10);
             const sceneB = parseInt(b.scene_number, 10);
@@ -293,17 +366,16 @@ app.post('/api/stitch-videos', async (req, res) => {
             console.log(`Downloaded video ${i + 1}/${sortedVideos.length}: Scene ${video.scene_number}`);
         }
 
-        // Step 3: Stitch videos together
-        console.log('Step 3: Stitching videos...');
+        // Stitch videos together
+        console.log('Step 4: Stitching videos...');
         const stitchedVideoPath = path.join(jobDir, 'stitched_video.mp4');
         await stitchVideos(videoPaths, stitchedVideoPath);
 
-        // Step 4: Add audio and overlay
-        console.log('Step 4: Adding audio and overlay to final video...');
+        // Add audio and overlay
+        console.log('Step 5: Adding audio and overlay to final video...');
         const finalVideoPath = path.join(OUTPUT_DIR, `final_video_${jobId}.mp4`);
         await addAudioAndOverlayToVideo(stitchedVideoPath, trimmedAudioPath, finalVideoPath, overlayImagePath, overlay_options || {});
 
-        // Step 5: Get final video stats
         const finalDuration = await getVideoDuration(finalVideoPath);
         const stats = await fs.stat(finalVideoPath);
 
@@ -316,6 +388,7 @@ app.post('/api/stitch-videos', async (req, res) => {
             success: true,
             jobId: jobId,
             downloadUrl: `/download/${jobId}`,
+            finalVideoUrl: `${req.protocol}://${req.get('host')}/download/${jobId}`,
             videoStats: {
                 duration: finalDuration,
                 fileSize: stats.size,
@@ -337,27 +410,31 @@ app.post('/api/stitch-videos', async (req, res) => {
     }
 });
 
-// Alternative endpoint for file upload overlay
-app.post('/api/stitch-videos-with-upload', upload.single('overlay_image'), async (req, res) => {
+// Alternative endpoint for file upload overlay (works with both endpoints)
+app.post('/api/add-overlay-with-upload', upload.single('overlay_image'), async (req, res) => {
     const jobId = uuidv4();
-    console.log(`Starting video stitching job ${jobId} with file upload`);
+    console.log(`Starting overlay job ${jobId} with file upload`);
     
     try {
-        const { videos, mv_audio, overlay_options } = JSON.parse(req.body.data || '{}');
+        const { final_stitch_video, final_music_url, overlay_options } = JSON.parse(req.body.data || '{}');
         
-        if (!videos || !Array.isArray(videos) || !mv_audio) {
+        if (!final_stitch_video || !final_music_url) {
             return res.status(400).json({ 
-                error: 'Invalid input. Expected videos array and mv_audio URL in data field' 
+                error: 'Invalid input. Expected final_stitch_video and final_music_url in data field' 
             });
         }
 
         const jobDir = path.join(TEMP_DIR, jobId);
         await fs.mkdir(jobDir, { recursive: true });
 
+        // Download video
+        const videoPath = path.join(jobDir, 'input_video.mp4');
+        await downloadFile(final_stitch_video, videoPath);
+
         // Process audio
         const audioPath = path.join(jobDir, 'audio.mp3');
         const trimmedAudioPath = path.join(jobDir, 'audio_trimmed.mp3');
-        await downloadFile(mv_audio, audioPath);
+        await downloadFile(final_music_url, audioPath);
         await trimAudio(audioPath, trimmedAudioPath, 60);
 
         // Handle uploaded overlay image
@@ -368,22 +445,8 @@ app.post('/api/stitch-videos-with-upload', upload.single('overlay_image'), async
             await fs.unlink(req.file.path);
         }
 
-        // Process videos
-        const sortedVideos = videos.sort((a, b) => parseInt(a.scene_number, 10) - parseInt(b.scene_number, 10));
-        const videoPaths = [];
-        
-        for (let i = 0; i < sortedVideos.length; i++) {
-            const video = sortedVideos[i];
-            const videoPath = path.join(jobDir, `video_${String(video.scene_number).padStart(3, '0')}.mp4`);
-            await downloadFile(video.final_video_url, videoPath);
-            videoPaths.push(videoPath);
-        }
-
-        const stitchedVideoPath = path.join(jobDir, 'stitched_video.mp4');
-        await stitchVideos(videoPaths, stitchedVideoPath);
-
         const finalVideoPath = path.join(OUTPUT_DIR, `final_video_${jobId}.mp4`);
-        await addAudioAndOverlayToVideo(stitchedVideoPath, trimmedAudioPath, finalVideoPath, overlayImagePath, overlay_options || {});
+        await addAudioAndOverlayToVideo(videoPath, trimmedAudioPath, finalVideoPath, overlayImagePath, overlay_options || {});
 
         const finalDuration = await getVideoDuration(finalVideoPath);
         const stats = await fs.stat(finalVideoPath);
@@ -394,14 +457,14 @@ app.post('/api/stitch-videos-with-upload', upload.single('overlay_image'), async
             success: true,
             jobId: jobId,
             downloadUrl: `/download/${jobId}`,
+            finalVideoUrl: `${req.protocol}://${req.get('host')}/download/${jobId}`,
             videoStats: {
                 duration: finalDuration,
                 fileSize: stats.size,
                 fileSizeMB: (stats.size / (1024 * 1024)).toFixed(2)
             },
-            processedVideos: videos.length,
             overlayApplied: !!overlayImagePath,
-            message: `Successfully processed ${videos.length} videos with overlay from uploaded file`
+            message: 'Successfully added audio and overlay to video from uploaded file'
         });
 
     } catch (error) {
@@ -414,7 +477,7 @@ app.post('/api/stitch-videos-with-upload', upload.single('overlay_image'), async
     }
 });
 
-// Download endpoint for stitched videos
+// Download endpoint for processed videos
 app.get('/download/:jobId', async (req, res) => {
     try {
         const { jobId } = req.params;
@@ -438,36 +501,78 @@ app.get('/download/:jobId', async (req, res) => {
     }
 });
 
+// Stream endpoint for viewing videos in browser
+app.get('/stream/:jobId', async (req, res) => {
+    try {
+        const { jobId } = req.params;
+        const filePath = path.join(OUTPUT_DIR, `final_video_${jobId}.mp4`);
+        
+        await fs.access(filePath);
+        const stats = await fs.stat(filePath);
+        
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Length', stats.size);
+        res.setHeader('Accept-Ranges', 'bytes');
+        
+        const fileStream = require('fs').createReadStream(filePath);
+        fileStream.pipe(res);
+        
+    } catch (error) {
+        res.status(404).json({ 
+            error: 'Video file not found or not accessible',
+            details: error.message 
+        });
+    }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
-    res.json({ status: 'OK', service: 'Integrated Video Processing Service' });
+    res.json({ 
+        status: 'OK', 
+        service: 'Integrated Video Processing Service',
+        timestamp: new Date().toISOString()
+    });
 });
 
 // Root endpoint with API documentation
 app.get('/', (req, res) => {
     res.json({
         service: 'Integrated Video Processing Service',
-        version: '3.0.0',
+        version: '4.0.0',
         endpoints: {
-            stitchVideos: 'POST /api/stitch-videos',
-            stitchWithUpload: 'POST /api/stitch-videos-with-upload (multipart/form-data)',
-            download: 'GET /download/:jobId',
+            addOverlay: 'POST /api/add-overlay (single video + audio + overlay)',
+            stitchVideos: 'POST /api/stitch-videos (multiple videos + audio + overlay)',
+            addOverlayUpload: 'POST /api/add-overlay-with-upload (multipart/form-data)',
+            download: 'GET /download/:jobId (download video file)',
+            stream: 'GET /stream/:jobId (stream video in browser)',
             health: 'GET /health'
         },
         usage: {
-            description: 'Send POST request with video data and optional image overlay',
-            example: {
-                videos: [
-                    { scene_number: 1, final_video_url: 'https://...' },
-                    { scene_number: 2, final_video_url: 'https://...' }
-                ],
-                mv_audio: 'https://audio-url.com/audio.mp3',
-                overlay_image_url: 'https://example.com/logo.png',
-                overlay_options: {
-                    position: 'bottom-right',
-                    size: '150',
-                    margin: '20',
-                    opacity: '1.0'
+            singleVideo: {
+                endpoint: '/api/add-overlay',
+                description: 'Add audio and overlay to a single video',
+                example: {
+                    final_stitch_video: 'https://your-video-url.mp4',
+                    final_music_url: 'https://your-audio-url.mp3',
+                    overlay_image_url: 'https://your-overlay-image.png',
+                    overlay_options: {
+                        position: 'bottom-right',
+                        size: '150',
+                        margin: '20',
+                        opacity: '1.0'
+                    }
+                }
+            },
+            multipleVideos: {
+                endpoint: '/api/stitch-videos',
+                description: 'Stitch multiple videos together with audio and overlay',
+                example: {
+                    videos: [
+                        { scene_number: 1, final_video_url: 'https://...' },
+                        { scene_number: 2, final_video_url: 'https://...' }
+                    ],
+                    mv_audio: 'https://your-audio-url.mp3',
+                    overlay_image_url: 'https://your-overlay-image.png'
                 }
             },
             overlayPositions: ['top-left', 'top-right', 'bottom-left', 'bottom-right']
@@ -482,6 +587,7 @@ async function startServer() {
     app.listen(PORT, () => {
         console.log(`Integrated Video Processing Service running on port ${PORT}`);
         console.log(`Health check: http://localhost:${PORT}/health`);
+        console.log(`API documentation: http://localhost:${PORT}/`);
     });
 }
 
