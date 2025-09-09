@@ -264,36 +264,39 @@ async function addOverlayToImage(baseImagePath, overlayImagePath, outputPath, ov
     return new Promise((resolve, reject) => {
         const {
             position = 'bottom-right',
-            size = '150',
-            margin = '20'
+            size = '150',        // Same as video: 150px width
+            margin = '20'        // Same as video: 20px margin
         } = overlayOptions;
         
-        // Use simple ffmpeg image processing - no complex filters
-        let overlayPosition;
+        // Use exact same positioning logic as video overlay
+        let x, y;
         switch (position) {
             case 'top-left':
-                overlayPosition = `${margin}:${margin}`;
+                x = margin;
+                y = margin;
                 break;
             case 'top-right':
-                overlayPosition = `W-w-${margin}:${margin}`;
+                x = `W-w-${margin}`;
+                y = margin;
                 break;
             case 'bottom-left':
-                overlayPosition = `${margin}:H-h-${margin}`;
+                x = margin;
+                y = `H-h-${margin}`;
                 break;
             case 'bottom-right':
             default:
-                overlayPosition = `W-w-${margin}:H-h-${margin}`;
+                x = `W-w-${margin}`;
+                y = `H-h-${margin}`;
                 break;
         }
         
-        // Simple two-step process: scale overlay, then composite
+        // Use same filter approach as video: scale overlay to size, then position
         ffmpeg()
             .input(baseImagePath)
             .input(overlayImagePath)
-            .complexFilter(`overlay=${overlayPosition}`)
+            .complexFilter(`[1:v]scale=${size}:-1[overlay]; [0:v][overlay]overlay=${x}:${y}[out]`)
             .outputOptions([
-                '-vcodec', 'png',
-                '-f', 'image2',
+                '-map', '[out]',
                 '-vframes', '1'
             ])
             .output(outputPath)
